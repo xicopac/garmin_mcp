@@ -12,7 +12,7 @@ import json
 import logging
 from typing import Any
 
-import strength_exercise_catalog
+from garmin_mcp import strength_exercise_catalog
 
 
 garmin_client = None
