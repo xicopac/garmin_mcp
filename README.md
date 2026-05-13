@@ -41,8 +41,37 @@ This MCP server implements **110+ tools** covering ~90% of the [python-garmincon
 - ✅ High-Level Workout Builders (4 tools) - create and schedule workouts without writing JSON
 - ✅ Courses (3 tools) - list / upload GPX as course / delete course
 - ✅ Activity Analysis (2 tools) - FIT file parsing, Power Duration Curve; requires power meter and/or Di2
+- ✅ Advanced Strength Workouts (20+ tools) - block-based workouts, exercise resolution, validation, verification, bulk scheduling
 
 > **Note:** Activity Analysis tools require a compatible power meter (e.g., Garmin Rally, Favero Assioma, PowerTap P1) and/or Shimano Di2 / SRAM eTap electronic shifting. The `fitparse` dependency is installed automatically.
+
+### Advanced Strength Workout Tools
+
+This fork adds enhanced strength workout functionality:
+
+- **Block-based workout builder** - Create complex workouts with blocks, rounds, and repeat groups
+- **Exercise resolution** - Map exercise names to Garmin's global exercise catalog with aliases
+- **Pre-upload validation** - Validate workout structure before uploading to Garmin
+- **Post-upload verification** - Verify Garmin preserved exercise names after upload (strict/compatible/lenient modes)
+- **Safe/verified exercise mode** - Only use exercises known to round-trip correctly
+- **Export/clone** - Export existing workouts as definitions, clone templates
+- **Bulk scheduling** - Schedule multiple workouts at once
+- **Compact output mode** - Reduced verbosity for create/schedule operations
+
+Example workflow:
+```
+create_strength_workout(
+  name="Back & Shoulders - Pull Heavy",
+  blocks=[
+    {"name": "Main Pull", "rounds": 4, "steps": [
+      {"name": "Lat Pull-down", "reps": 8, "weight": 40, "rest_seconds": 90},
+      {"name": "Seated Cable Row", "reps": 8, "weight": 40, "rest_seconds": 90}
+    ]}
+  ],
+  verify_after_upload=True,
+  verification_mode="lenient"
+)
+```
 
 ### Intentionally Skipped Endpoints
 
