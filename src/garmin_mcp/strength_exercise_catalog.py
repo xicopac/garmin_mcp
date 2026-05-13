@@ -878,7 +878,7 @@ def resolve_exercise(name: str, safe_only: bool = False) -> dict[str, Any] | Non
     }
 
 
-def resolve_strength_exercises_bulk(exercises: list[str], safe_only: bool = False) -> list[dict[str, Any]]:
+def _resolve_strength_exercises_bulk(exercises: list[str], safe_only: bool = False) -> list[dict[str, Any]]:
     """Resolve multiple exercises by name - handles multi-exercise queries.
     
     Splits long queries into individual exercises and resolves each one.
@@ -1431,7 +1431,7 @@ def register_tools(app: Any) -> Any:
         Returns resolved exercise info for each requested exercise, or suggestions if not found.
         Use safe_only=true to only return known_good (verified) exercises.
         """
-        results = resolve_strength_exercises_bulk(exercises, safe_only=safe_only)
+        results = _resolve_strength_exercises_bulk(exercises, safe_only=safe_only)
         resolved_count = sum(1 for r in results if r.get("status") == "resolved")
         return json.dumps({
             "status": "success",
