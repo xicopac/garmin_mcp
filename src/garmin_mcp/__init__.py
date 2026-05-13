@@ -28,6 +28,8 @@ from garmin_mcp import nutrition
 from garmin_mcp import workout_builders
 from garmin_mcp import courses
 from garmin_mcp import activity_analysis
+from garmin_mcp import strength_workouts
+from garmin_mcp import strength_exercise_catalog
 
 
 def is_interactive_terminal() -> bool:
@@ -239,6 +241,8 @@ def main():
     workout_builders.configure(garmin_client)
     courses.configure(garmin_client)
     activity_analysis.configure(garmin_client)
+    strength_workouts.configure(garmin_client)
+    strength_exercise_catalog.configure(garmin_client)
 
     # Create the MCP app
     app = FastMCP("Garmin Connect v1.0")
@@ -259,6 +263,8 @@ def main():
     app = workout_builders.register_tools(app)
     app = courses.register_tools(app)
     app = activity_analysis.register_tools(app)
+    app = strength_workouts.register_tools(app)
+    app = strength_exercise_catalog.register_tools(app)
 
     # Register resources (workout templates)
     app = workout_templates.register_resources(app)
