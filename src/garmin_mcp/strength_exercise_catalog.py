@@ -1,6 +1,7 @@
 """Persisted Garmin strength exercise catalog for MCP tools."""
 
 import json
+import inspect
 import logging
 import os
 import re
@@ -929,6 +930,11 @@ def _resolve_strength_exercises_bulk(exercises: list[str], safe_only: bool = Fal
     return results
 
 
+def resolve_strength_exercises_bulk(exercises: list[str], safe_only: bool = False) -> list[dict[str, Any]]:
+    """Public synchronous bulk exercise resolver for tests and non-MCP callers."""
+    return _resolve_strength_exercises_bulk(exercises, safe_only=safe_only)
+
+
 def roundtrip_warning(entry: dict[str, Any]) -> str | None:
     status = entry.get("roundtrip_status") or "unknown"
     display = entry.get("display_name") or entry.get("exercise_name") or "Exercise"
@@ -1430,13 +1436,40 @@ def register_tools(app: Any) -> Any:
         
         Returns resolved exercise info for each requested exercise, or suggestions if not found.
         Use safe_only=true to only return known_good (verified) exercises.
+        Example: {"exercises":["Pull-up","Chest Supported Dumbbell Row","Farmer Carry"],"safe_only":false}
         """
         results = _resolve_strength_exercises_bulk(exercises, safe_only=safe_only)
+        if inspect.isawaitable(results):
+            results = await results
         resolved_count = sum(1 for r in results if r.get("status") == "resolved")
+        resolved = [
+            {
+                "requested": item.get("requested"),
+                "display_name": item.get("display_name"),
+                "category": item.get("category"),
+                "exercise_name": item.get("exercise_name"),
+                "supports_reps": True,
+                "supports_time": item.get("category") in {"CARRY", "CORE", "PLANK"},
+                "known_good": bool(item.get("known_good")),
+            }
+            for item in results
+            if item.get("status") == "resolved"
+        ]
+        unresolved = [
+            {
+                "requested": item.get("requested"),
+                "suggestions": item.get("suggestions", []),
+            }
+            for item in results
+            if item.get("status") != "resolved"
+        ]
         return json.dumps({
             "status": "success",
             "requested_count": len(exercises),
             "resolved_count": resolved_count,
+            "resolved": resolved,
+            "unresolved": unresolved,
+            "warnings": [],
             "results": results,
         }, indent=2)
 

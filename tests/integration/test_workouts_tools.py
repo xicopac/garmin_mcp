@@ -391,6 +391,7 @@ async def test_get_scheduled_workouts_tool(app_with_workouts, mock_garmin_client
             "workoutScheduleSummariesScalar": [
                 {
                     "workoutUuid": "abc-123-def",
+                    "scheduledWorkoutId": 1648061908,
                     "workoutId": 123456,
                     "workoutName": "5K Tempo Run",
                     "workoutType": "running",
@@ -416,6 +417,7 @@ async def test_get_scheduled_workouts_tool(app_with_workouts, mock_garmin_client
     assert result_data["count"] == 1
     workout = result_data["scheduled_workouts"][0]
     assert workout["name"] == "5K Tempo Run"
+    assert workout["scheduled_workout_id"] == 1648061908
     assert workout["sport"] == "running"
     assert workout["completed"] is False
     assert workout["training_plan"] == "5K Training Plan"
@@ -1034,3 +1036,319 @@ async def test_schedule_workouts_inline_upload_no_id_returned(app_with_workouts,
     assert result_data["failed"] == 1
     assert result_data["results"][0]["status"] == "failed"
     mock_garmin_client.client.post.assert_not_called()
+
+
+# =============================================================================
+# Rich Garmin API error reporting (upload_workout / upload_workouts /
+# schedule_workouts) and the new running-workout MCP tools.
+# =============================================================================
+
+def _structured_run_payload():
+    """Mirrors the failing-then-fixed progression run from the bug report."""
+    return {
+        "workoutName": "Progression Run",
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+            "workoutSteps": [
+                {"type": "ExecutableStepDTO", "stepOrder": 1,
+                 "stepType": {"stepTypeId": 1, "stepTypeKey": "warmup"},
+                 "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                 "endConditionValue": 900.0,
+                 "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}},
+                {"type": "ExecutableStepDTO", "stepOrder": 2,
+                 "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+                 "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                 "endConditionValue": 900.0,
+                 "targetType": {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"},
+                 "zoneNumber": 3},
+                {"type": "ExecutableStepDTO", "stepOrder": 3,
+                 "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+                 "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                 "endConditionValue": 900.0,
+                 "targetType": {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"},
+                 "zoneNumber": 4},
+                {"type": "ExecutableStepDTO", "stepOrder": 4,
+                 "stepType": {"stepTypeId": 2, "stepTypeKey": "cooldown"},
+                 "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                 "endConditionValue": 300.0,
+                 "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}},
+            ],
+        }],
+    }
+
+
+def _tempo_blocks_payload():
+    """Mirrors the failing-then-fixed tempo-blocks workout with a RepeatGroupDTO."""
+    return {
+        "workoutName": "Tempo Blocks",
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+            "workoutSteps": [
+                {"type": "ExecutableStepDTO", "stepOrder": 1,
+                 "stepType": {"stepTypeId": 1, "stepTypeKey": "warmup"},
+                 "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                 "endConditionValue": 600.0,
+                 "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}},
+                {"type": "RepeatGroupDTO", "stepOrder": 2, "numberOfIterations": 3,
+                 "workoutSteps": [
+                     {"type": "ExecutableStepDTO", "stepOrder": 1,
+                      "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+                      "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                      "endConditionValue": 480.0,
+                      "targetType": {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"},
+                      "zoneNumber": 4},
+                     {"type": "ExecutableStepDTO", "stepOrder": 2,
+                      "stepType": {"stepTypeId": 4, "stepTypeKey": "recovery"},
+                      "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                      "endConditionValue": 180.0,
+                      "targetType": {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"},
+                      "zoneNumber": 2}]},
+                {"type": "ExecutableStepDTO", "stepOrder": 3,
+                 "stepType": {"stepTypeId": 2, "stepTypeKey": "cooldown"},
+                 "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                 "endConditionValue": 300.0,
+                 "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}},
+            ],
+        }],
+    }
+
+
+@pytest.mark.asyncio
+async def test_upload_workout_progression_run_uploads(app_with_workouts, mock_garmin_client):
+    """Acceptance: a progression run with warmup/cooldown uploads successfully."""
+    import json as json_module
+    mock_garmin_client.upload_workout.return_value = {
+        "workoutId": 4242, "workoutName": "Progression Run",
+    }
+
+    payload = _structured_run_payload()
+    result = await app_with_workouts.call_tool("upload_workout", {"workout_data": payload})
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "success"
+    assert data["workout_id"] == 4242
+    # The exact payload (with all warmup/interval/cooldown steps) was forwarded.
+    forwarded = mock_garmin_client.upload_workout.call_args[0][0]
+    keys = [s["stepType"]["stepTypeKey"] for s in forwarded["workoutSegments"][0]["workoutSteps"]]
+    assert keys == ["warmup", "interval", "interval", "cooldown"]
+
+
+@pytest.mark.asyncio
+async def test_upload_workout_tempo_blocks_with_repeat_group_uploads(app_with_workouts, mock_garmin_client):
+    """Acceptance: a tempo-blocks workout with RepeatGroupDTO uploads successfully."""
+    import json as json_module
+    mock_garmin_client.upload_workout.return_value = {
+        "workoutId": 4343, "workoutName": "Tempo Blocks",
+    }
+
+    payload = _tempo_blocks_payload()
+    result = await app_with_workouts.call_tool("upload_workout", {"workout_data": payload})
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "success"
+    forwarded = mock_garmin_client.upload_workout.call_args[0][0]
+    rg = forwarded["workoutSegments"][0]["workoutSteps"][1]
+    assert rg["type"] == "RepeatGroupDTO"
+    assert rg["numberOfIterations"] == 3
+    assert len(rg["workoutSteps"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_upload_workout_surfaces_garmin_response_body_on_400(app_with_workouts, mock_garmin_client):
+    """When Garmin rejects with HTTP 400, the response now includes the body, endpoint, method, and step summary."""
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    # Build an exception whose .response mimics a real requests.HTTPError response.
+    resp = MagicMock()
+    resp.status_code = 400
+    resp.url = "https://connectapi.garmin.com/workout-service/workout"
+    resp.json.side_effect = ValueError("not json")
+    resp.text = "RepeatGroup: numberOfIterations is required."
+    boom = RuntimeError("API Error 400 - HTTP 400 Bad Request")
+    boom.response = resp
+    mock_garmin_client.upload_workout.side_effect = boom
+
+    payload = _tempo_blocks_payload()
+    # Strip the iterations to simulate the failing payload.
+    payload["workoutSegments"][0]["workoutSteps"][1].pop("numberOfIterations", None)
+
+    result = await app_with_workouts.call_tool("upload_workout", {"workout_data": payload})
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "error"
+    assert data["operation"] == "upload_workout"
+    assert data["http_status"] == 400
+    assert data["request_method"] == "POST"
+    assert data["request_endpoint"] == "/workout-service/workout"
+    assert "numberOfIterations" in data["response_body_text"]
+    # Sanitized payload summary should expose the failing step layout.
+    assert data["workout"]["workoutName"] == "Tempo Blocks"
+    assert data["workout"]["sport"] == "running"
+    summary_steps = data["workout"]["first_segment"]["steps"]
+    assert any(step["dto"] == "RepeatGroupDTO" for step in summary_steps)
+
+
+@pytest.mark.asyncio
+async def test_upload_workout_parses_garmin_connect_string_when_no_response(app_with_workouts, mock_garmin_client):
+    """garminconnect 0.3.2 raises GarminConnectConnectionError(string) — we must still
+    extract status + body fragment from the string."""
+    import json as json_module
+
+    mock_garmin_client.upload_workout.side_effect = RuntimeError(
+        "API Error 400 - RepeatGroup: numberOfIterations is required."
+    )
+
+    result = await app_with_workouts.call_tool(
+        "upload_workout", {"workout_data": _tempo_blocks_payload()}
+    )
+    data = json_module.loads(result[0][0].text)
+    assert data["status"] == "error"
+    assert data["http_status"] == 400
+    assert "numberOfIterations" in data["response_body_text"]
+
+
+@pytest.mark.asyncio
+async def test_upload_workouts_partial_failure_preserves_rich_error(app_with_workouts, mock_garmin_client):
+    """upload_workouts bulk failures keep http_status + body + step summary per entry."""
+    import json as json_module
+
+    mock_garmin_client.upload_workout.side_effect = [
+        {"workoutId": 1, "workoutName": "OK Run"},
+        RuntimeError("API Error 400 - missing stepType somewhere"),
+    ]
+
+    good = _structured_run_payload()
+    good["workoutName"] = "OK Run"
+    bad = _tempo_blocks_payload()
+    bad["workoutName"] = "Bad Run"
+    result = await app_with_workouts.call_tool(
+        "upload_workouts", {"workouts": [good, bad]}
+    )
+    data = json_module.loads(result[0][0].text)
+    assert data["succeeded"] == 1 and data["failed"] == 1
+    bad_entry = data["results"][1]
+    assert bad_entry["status"] == "error"
+    assert bad_entry["http_status"] == 400
+    assert "missing stepType" in bad_entry["response_body_text"]
+    assert bad_entry["workout"]["workoutName"] == "Bad Run"
+
+
+@pytest.mark.asyncio
+async def test_schedule_workouts_inline_upload_failure_preserves_full_error(app_with_workouts, mock_garmin_client):
+    """When inline workout_data upload fails inside schedule_workouts, the entry must
+    carry the full upload error (status/body/endpoint/summary) and never reach the
+    schedule HTTP call."""
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    resp = MagicMock()
+    resp.status_code = 400
+    resp.url = "https://connectapi.garmin.com/workout-service/workout"
+    resp.json.side_effect = ValueError("nope")
+    resp.text = "RepeatGroup: numberOfIterations is required."
+    upload_err = RuntimeError("API Error 400 - HTTP 400 Bad Request")
+    upload_err.response = resp
+    mock_garmin_client.upload_workout.side_effect = upload_err
+
+    inline = _tempo_blocks_payload()
+    inline["workoutName"] = "Bad Inline Upload"
+
+    result = await app_with_workouts.call_tool(
+        "schedule_workouts",
+        {"schedules": [{"workout_data": inline, "calendar_date": "2026-05-20"}]},
+    )
+    data = json_module.loads(result[0][0].text)
+    assert data["total"] == 1
+    assert data["succeeded"] == 0
+    assert data["failed"] == 1
+    entry = data["results"][0]
+    assert entry["status"] == "error"
+    assert entry["stage"] == "upload"
+    assert entry["http_status"] == 400
+    assert "numberOfIterations" in entry["response_body_text"]
+    assert entry["name"] == "Bad Inline Upload"
+    assert entry["scheduled_date"] == "2026-05-20"
+    # Critically, we never attempted to schedule.
+    mock_garmin_client.client.post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_schedule_workouts_schedule_failure_includes_body(app_with_workouts, mock_garmin_client):
+    """schedule step failure (HTTP 4xx) should include response body when available."""
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    schedule_resp = MagicMock()
+    schedule_resp.status_code = 409
+    schedule_resp.json.side_effect = ValueError("no json")
+    schedule_resp.text = "Workout already scheduled on that date"
+    mock_garmin_client.client.post.return_value = schedule_resp
+
+    result = await app_with_workouts.call_tool(
+        "schedule_workouts",
+        {"schedules": [{"workout_id": 999, "calendar_date": "2026-05-20"}]},
+    )
+    data = json_module.loads(result[0][0].text)
+    entry = data["results"][0]
+    assert entry["status"] == "failed"
+    assert entry["http_status"] == 409
+    assert entry["stage"] == "schedule"
+    assert "already scheduled" in entry["response_body_text"]
+    assert entry["request_endpoint"] == "/workout-service/schedule/999"
+
+
+@pytest.mark.asyncio
+async def test_validate_running_workout_tool_returns_ok_for_canonical_payload(app_with_workouts, mock_garmin_client):
+    import json as json_module
+
+    result = await app_with_workouts.call_tool(
+        "validate_running_workout", {"workout_data": _structured_run_payload()}
+    )
+    data = json_module.loads(result[0][0].text)
+    assert data["ok"] is True
+    assert data["issues"] == []
+    assert data["summary"]["sport"] == "running"
+    # validator must not touch Garmin.
+    mock_garmin_client.upload_workout.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_validate_running_workout_tool_flags_broken_repeat_group(app_with_workouts):
+    import json as json_module
+
+    broken = _tempo_blocks_payload()
+    broken["workoutSegments"][0]["workoutSteps"][1].pop("numberOfIterations", None)
+
+    result = await app_with_workouts.call_tool(
+        "validate_running_workout", {"workout_data": broken}
+    )
+    data = json_module.loads(result[0][0].text)
+    assert data["ok"] is False
+    assert any("numberOfIterations" in issue for issue in data["issues"])
+
+
+@pytest.mark.asyncio
+async def test_preview_running_workout_tool_includes_schema_on_invalid(app_with_workouts):
+    import json as json_module
+
+    broken = _structured_run_payload()
+    # Break a stepType id/key pair.
+    broken["workoutSegments"][0]["workoutSteps"][1]["stepType"] = {
+        "stepTypeId": 3, "stepTypeKey": "warmup",
+    }
+
+    result = await app_with_workouts.call_tool(
+        "preview_running_workout", {"workout_data": broken}
+    )
+    data = json_module.loads(result[0][0].text)
+    assert data["status"] == "invalid"
+    assert data["valid"] is False
+    assert any("stepTypeId" in i and "warmup" in i for i in data["issues"])
+    assert "expected_step_types" in data
+    assert data["expected_step_types"]["interval"] == 3
+    assert data["expected_step_types"]["recovery"] == 4

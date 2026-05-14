@@ -17,6 +17,7 @@ os.environ["GARMIN_GLOBAL_CATALOG_FILE"] = str(Path(_tmp.name) / "garmin_global_
 
 import strength_exercise_catalog  # noqa: E402
 import strength_workouts  # noqa: E402
+import connector_info  # noqa: E402
 
 # Populate the GLOBAL catalog with test data (mimics Garmin's Exercises.json structure)
 test_data = {
@@ -43,6 +44,7 @@ test_data = {
         },
         "PULL_UP": {
             "exercises": {
+                "PULL_UP": {"primaryMuscles": ["LATS"], "secondaryMuscles": []},
                 "LAT_PULLDOWN": {"primaryMuscles": ["LATS"], "secondaryMuscles": []},
                 "CLOSE_GRIP_LAT_PULL_DOWN": {"primaryMuscles": ["LATS"], "secondaryMuscles": []},
             }
@@ -140,6 +142,7 @@ test_translations = {
     "LATERAL_RAISE_BENT_OVER_LATERAL_RAISE": "Bent-over Lateral Raise",
     "LATERAL_RAISE_SEATED_REAR_LATERAL_RAISE": "Seated Rear Lateral Raise",
     "PLANK_PLANK": "Plank",
+    "PULL_UP_PULL_UP": "Pull-up",
     "PULL_UP_LAT_PULLDOWN": "Lat Pull-down",
     "PULL_UP_CLOSE_GRIP_LAT_PULL_DOWN": "Close-grip Lat Pull-down",
     "BENCH_PRESS_BARBELL_BENCH_PRESS": "Barbell Bench Press",
@@ -473,6 +476,69 @@ class StrengthWorkoutBuilderTest(unittest.TestCase):
         self.assertIn("mapping_failures", preview)
         self.assertIn("upload_blocked", create)
 
+    def test_validation_rejects_common_schema_mistakes(self):
+        validation = strength_workouts.validate_strength_workout_definition(
+            "Bad schema",
+            blocks=[{"name": "Bad", "exercises": [{"name": "Pull-up", "reps": 8}]}],
+        )
+        self.assertEqual(validation["status"], "error")
+        self.assertIn("blocks[0].exercises", validation["issues"][0]["message"])
+
+        validation = strength_workouts.validate_strength_workout_definition(
+            "Bad sets",
+            blocks=[{"name": "Bad", "steps": [{"name": "Pull-up", "reps": 8, "sets": 4}]}],
+        )
+        self.assertEqual(validation["status"], "error")
+        self.assertTrue(any("use rounds on the block" in issue["message"] for issue in validation["issues"]))
+
+    def test_bodyweight_pullup_omits_weight_and_rejects_zero(self):
+        ok = strength_workouts.preview_strength_workout_definition(
+            "Pull",
+            blocks=[{"name": "Pull", "rounds": 4, "steps": [{"name": "Pull-up", "reps": 8, "rest_seconds": 90}]}],
+        )
+        self.assertTrue(ok["upload_ready"])
+
+        bad = strength_workouts.preview_strength_workout_definition(
+            "Pull",
+            blocks=[{"name": "Pull", "rounds": 4, "steps": [{"name": "Pull-up", "reps": 8, "weight": 0}]}],
+        )
+        self.assertFalse(bad["upload_ready"])
+        self.assertTrue(any("omit weight" in issue["message"] for issue in bad["validation"]["issues"]))
+
+    def test_timed_farmer_carry_preview_create_payload_parity(self):
+        blocks = [{"name": "Carry", "rounds": 3, "steps": [{"name": "Farmer Carry", "duration_seconds": 45, "weight": 26, "rest_seconds": 60}]}]
+        preview = strength_workouts.preview_strength_workout_definition("Carry", blocks=blocks)
+        self.assertTrue(preview["upload_ready"])
+        payload = strength_workouts.build_strength_workout_payload("Carry", blocks=blocks)
+        nested = payload["workoutSegments"][0]["workoutSteps"][0]["workoutSteps"][0]
+        self.assertEqual(nested["endCondition"]["conditionTypeKey"], "time")
+        self.assertEqual(nested["endConditionValue"], 45.0)
+        self.assertEqual(nested["weightValue"], 26.0)
+
+
+class ConnectorInfoTest(unittest.TestCase):
+    def test_help_strength_workouts(self):
+        payload = connector_info._topic_payload("strength_workouts")
+        self.assertEqual(payload["status"], "success")
+        self.assertIn("replace_scheduled_strength_workout", payload["recommended_tools"])
+        self.assertIn("strength_workout", payload["schemas"])
+
+    def test_recommend_replace_strength_workout(self):
+        payload = connector_info.recommend_tools_for_intent("replace scheduled strength workout")
+        self.assertEqual(payload["single_tool_shortcut"], "replace_scheduled_strength_workout")
+        self.assertIn("get_scheduled_workouts", payload["recommended_sequence"])
+
+    def test_help_workouts_exposes_running_schema(self):
+        payload = connector_info._topic_payload("workouts", verbose=True)
+        self.assertEqual(payload["status"], "success")
+        self.assertIn("validate_running_workout", payload["recommended_tools"])
+        self.assertIn("create_running_workout", payload["recommended_tools"])
+        self.assertIn("running_workout", payload["schemas"])
+        # The canonical running examples should be present in verbose mode.
+        names = {ex.get("workoutName") for ex in payload.get("examples", [])}
+        self.assertIn("Progression Run", names)
+        self.assertIn("Tempo Blocks", names)
+
 
 class FakeGarminClient:
     garmin_workouts = "/workout-service"
@@ -498,6 +564,54 @@ class UploadingFakeGarminClient(FakeGarminClient):
     def upload_workout(self, payload):
         self.uploaded = payload
         return {"workoutId": 123, "workoutName": payload["workoutName"]}
+
+
+class ReplacementFakeGarminClient(UploadingFakeGarminClient):
+    garmin_workouts = "/workout-service"
+    garmin_workouts_schedule_url = "/workout-service/schedule"
+
+    def __init__(self, fetched):
+        super().__init__(fetched)
+        self.posts = []
+
+    def query_garmin_graphql(self, query):
+        if self.posts:
+            return {
+                "data": {
+                    "workoutScheduleSummariesScalar": [
+                        {
+                            "scheduledWorkoutId": 333,
+                            "workoutId": 123,
+                            "workoutName": "New Pull",
+                            "workoutType": "strength_training",
+                            "scheduleDate": "2026-05-14",
+                            "associatedActivityId": None,
+                        }
+                    ]
+                }
+            }
+        return {
+            "data": {
+                "workoutScheduleSummariesScalar": [
+                    {
+                        "scheduledWorkoutId": 111,
+                        "workoutId": 222,
+                        "workoutName": "Old Pull",
+                        "workoutType": "strength_training",
+                        "scheduleDate": "2026-05-14",
+                        "associatedActivityId": None,
+                    }
+                ]
+            }
+        }
+
+    def post(self, scope, url, json=None, api=True):
+        self.posts.append((url, json))
+        class Resp:
+            def json(self_inner):
+                return {"scheduled": url, "payload": json}
+
+        return Resp()
 
 
 class StrengthUploadVerificationTest(unittest.TestCase):
@@ -612,6 +726,45 @@ class StrengthUploadVerificationTest(unittest.TestCase):
         # New behavior: uses Garmin's canonical mappings, shows generic warning for unknown roundtrip status
         self.assertIn("Garmin may accept this step but strip the internal exercise code after upload", text)
 
+    def test_replace_scheduled_strength_workout(self):
+        fetched = strength_workouts.build_strength_workout_payload(
+            "New Pull",
+            blocks=[{"name": "Pull", "steps": [{"name": "Pull-up", "reps": 8}]}],
+        )
+        fetched["workoutId"] = 123
+        client = ReplacementFakeGarminClient(fetched)
+        strength_workouts.configure(client)
+
+        class FakeApp:
+            def __init__(self):
+                self.tools = {}
+
+            def tool(self):
+                def register(fn):
+                    self.tools[fn.__name__] = fn
+                    return fn
+
+                return register
+
+        import asyncio
+
+        app = strength_workouts.register_tools(FakeApp())
+        result = json.loads(
+            asyncio.run(
+                app.tools["replace_scheduled_strength_workout"](
+                    date="2026-05-14",
+                    new_workout={
+                        "name": "New Pull",
+                        "blocks": [{"name": "Pull", "steps": [{"name": "Pull-up", "reps": 8}]}],
+                    },
+                )
+            )
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["removed"]["scheduled_workout_id"], 111)
+        self.assertEqual(result["created"]["workout_id"], 123)
+        self.assertTrue(result["verified"])
+
 
 class MultiExerciseSearchTest(unittest.TestCase):
     def test_bulk_resolution_handles_multiple_exercises(self):
@@ -651,11 +804,11 @@ class MultiExerciseSearchTest(unittest.TestCase):
 
 class BlockSchemaCompatibilityTest(unittest.TestCase):
     def test_exercises_key_accepted_as_alias_for_steps(self):
-        # This should work - using "exercises" instead of "steps"
+        # The validator rejects this common LLM mistake with a path-specific message.
         blocks = [
             {
                 "name": "Test Block",
-                "exercises": [  # Deprecated key, but accepted as alias
+                "exercises": [
                     {"exercise": "Dumbbell Row", "reps": 10, "rest_seconds": 30},
                 ]
             }
@@ -664,10 +817,8 @@ class BlockSchemaCompatibilityTest(unittest.TestCase):
             "Test",
             blocks=blocks,
         )
-        # Should have a deprecation warning but not fail
-        self.assertEqual(validation["status"], "success")
-        warning_codes = [issue.get("code") for issue in validation["issues"] if issue.get("severity") == "warning"]
-        self.assertIn("deprecated_key_exercises", warning_codes)
+        self.assertEqual(validation["status"], "error")
+        self.assertTrue(any(issue.get("code") == "deprecated_key_exercises" for issue in validation["issues"]))
     
     def test_sets_in_step_converted_properly(self):
         # Test that steps with "sets" are handled correctly

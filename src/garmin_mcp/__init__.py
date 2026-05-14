@@ -30,6 +30,7 @@ from garmin_mcp import courses
 from garmin_mcp import activity_analysis
 from garmin_mcp import strength_workouts
 from garmin_mcp import strength_exercise_catalog
+from garmin_mcp import connector_info
 
 
 def is_interactive_terminal() -> bool:
@@ -263,6 +264,7 @@ def main():
     app = workout_builders.register_tools(app)
     app = courses.register_tools(app)
     app = activity_analysis.register_tools(app)
+    app = connector_info.register_tools(app)
     app = strength_workouts.register_tools(app)
     app = strength_exercise_catalog.register_tools(app)
 

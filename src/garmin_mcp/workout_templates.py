@@ -104,6 +104,113 @@ INTERVAL_RUNNING_TEMPLATE = {
     }]
 }
 
+PROGRESSION_RUN_TEMPLATE = {
+    "workoutName": "Progression Run",
+    "description": "Progression: 15 min easy, 15 min Z3, 15 min Z4, 5 min cooldown",
+    "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+    "workoutSegments": [{
+        "segmentOrder": 1,
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSteps": [
+            {
+                "type": "ExecutableStepDTO",
+                "stepOrder": 1,
+                "stepType": {"stepTypeId": 1, "stepTypeKey": "warmup"},
+                "description": "Warmup 15 min easy",
+                "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                "endConditionValue": 900.0,
+                "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}
+            },
+            {
+                "type": "ExecutableStepDTO",
+                "stepOrder": 2,
+                "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+                "description": "15 min Z3",
+                "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                "endConditionValue": 900.0,
+                "targetType": {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"},
+                "zoneNumber": 3
+            },
+            {
+                "type": "ExecutableStepDTO",
+                "stepOrder": 3,
+                "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+                "description": "15 min Z4",
+                "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                "endConditionValue": 900.0,
+                "targetType": {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"},
+                "zoneNumber": 4
+            },
+            {
+                "type": "ExecutableStepDTO",
+                "stepOrder": 4,
+                "stepType": {"stepTypeId": 2, "stepTypeKey": "cooldown"},
+                "description": "Cooldown 5 min",
+                "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                "endConditionValue": 300.0,
+                "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}
+            }
+        ]
+    }]
+}
+
+TEMPO_BLOCKS_TEMPLATE = {
+    "workoutName": "Tempo Blocks",
+    "description": "Tempo blocks: 10 min warmup + 3 x (8 min Z4 + 3 min Z2 recovery) + 5 min cooldown",
+    "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+    "workoutSegments": [{
+        "segmentOrder": 1,
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSteps": [
+            {
+                "type": "ExecutableStepDTO",
+                "stepOrder": 1,
+                "stepType": {"stepTypeId": 1, "stepTypeKey": "warmup"},
+                "description": "Warmup 10 min",
+                "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                "endConditionValue": 600.0,
+                "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}
+            },
+            {
+                "type": "RepeatGroupDTO",
+                "stepOrder": 2,
+                "numberOfIterations": 3,
+                "workoutSteps": [
+                    {
+                        "type": "ExecutableStepDTO",
+                        "stepOrder": 1,
+                        "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+                        "description": "Tempo 8 min Z4",
+                        "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                        "endConditionValue": 480.0,
+                        "targetType": {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"},
+                        "zoneNumber": 4
+                    },
+                    {
+                        "type": "ExecutableStepDTO",
+                        "stepOrder": 2,
+                        "stepType": {"stepTypeId": 4, "stepTypeKey": "recovery"},
+                        "description": "Recovery 3 min Z2",
+                        "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                        "endConditionValue": 180.0,
+                        "targetType": {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"},
+                        "zoneNumber": 2
+                    }
+                ]
+            },
+            {
+                "type": "ExecutableStepDTO",
+                "stepOrder": 3,
+                "stepType": {"stepTypeId": 2, "stepTypeKey": "cooldown"},
+                "description": "Cooldown 5 min",
+                "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                "endConditionValue": 300.0,
+                "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}
+            }
+        ]
+    }]
+}
+
 TEMPO_RUN_TEMPLATE = {
     "workoutName": "Tempo Run",
     "description": "Tempo workout: warmup, 20min at tempo pace (HR zone 4), cooldown",
@@ -310,6 +417,25 @@ def register_resources(app):
         20min tempo block at HR zone 4.
         """
         return json.dumps(TEMPO_RUN_TEMPLATE, indent=2)
+
+    @app.resource("workout://templates/progression-run")
+    async def get_progression_run_template() -> str:
+        """Progression run template: 15 min easy -> 15 min Z3 -> 15 min Z4 -> 5 min cooldown.
+
+        Demonstrates back-to-back interval blocks with rising HR zone targets and no
+        RepeatGroupDTO. Uses the canonical Garmin DTOs (warmup=1, interval=3,
+        cooldown=2). Verified against the live Garmin Connect API.
+        """
+        return json.dumps(PROGRESSION_RUN_TEMPLATE, indent=2)
+
+    @app.resource("workout://templates/tempo-blocks")
+    async def get_tempo_blocks_template() -> str:
+        """Tempo blocks template: 10 min warmup + 3 x (8 min Z4 + 3 min Z2) + 5 min cooldown.
+
+        Demonstrates the canonical RepeatGroupDTO usage with HR zone targets on
+        both the work and recovery legs. Verified against the live Garmin Connect API.
+        """
+        return json.dumps(TEMPO_BLOCKS_TEMPLATE, indent=2)
 
     @app.resource("workout://templates/strength-circuit")
     async def get_strength_template() -> str:

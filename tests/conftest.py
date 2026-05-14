@@ -8,6 +8,16 @@ from mcp.server.fastmcp import FastMCP
 
 
 @pytest.fixture
+def no_retry_sleep(monkeypatch):
+    """Replace the calendar-refresh retry sleep with a no-op so tests never
+    actually wait between postcondition refetches."""
+    from garmin_mcp import workouts as _wk
+
+    monkeypatch.setattr(_wk, "_retry_sleep", lambda _s: None)
+    return None
+
+
+@pytest.fixture
 def mock_garmin_client():
     """Create a mock Garmin client with common methods stubbed"""
     client = Mock()

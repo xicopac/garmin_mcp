@@ -23,6 +23,15 @@ Garmin's API is accessed via the awesome [python-garminconnect](https://github.c
 - Training load trend (CTL/ATL/TSB), HRV trend, VO2 max trend, respiration rate trend
 - Power Duration Curve, climb detection with VAM, cardiac drift (aerobic decoupling), W/kg calculations
 
+## Start Here
+
+For LLM agents, the connector is self-documenting:
+
+- `garmin_mcp_help(topic="overview")` lists capability areas and first tools.
+- `garmin_mcp_help(topic="strength_workouts")` returns strength schemas, examples, workflows, and gotchas.
+- `garmin_mcp_help(topic="workouts", verbose=true)` returns the canonical running workout schema, working examples, and gotchas.
+- `recommend_garmin_tools(intent="create running workout")` returns the safest tool sequence and the single-tool shortcut.
+
 ### Tool Coverage
 
 This MCP server implements **110+ tools** covering ~90% of the [python-garminconnect](https://github.com/cyberjunky/python-garminconnect) library (v0.3.2):
@@ -59,19 +68,57 @@ This fork adds enhanced strength workout functionality:
 - **Compact output mode** - Reduced verbosity for create/schedule operations
 
 Example workflow:
+```json
+{
+  "name": "Back & Shoulders - Pull Heavy",
+  "description": "Complete pull-heavy day.",
+  "estimated_duration_seconds": 3300,
+  "use_repeat_groups": true,
+  "allow_substitutions": true,
+  "verify_after_upload": true,
+  "verification_mode": "lenient",
+  "verbose": false,
+  "blocks": [
+    {
+      "name": "Vertical Pull",
+      "rounds": 4,
+      "steps": [
+        {"name": "Pull-up", "reps": 8, "rest_seconds": 90}
+      ]
+    },
+    {
+      "name": "Heavy Row",
+      "rounds": 4,
+      "steps": [
+        {"name": "Chest Supported Dumbbell Row", "reps": 8, "weight": 20, "rest_seconds": 90}
+      ]
+    },
+    {
+      "name": "Carry Finisher",
+      "rounds": 3,
+      "steps": [
+        {"name": "Farmer Carry", "duration_seconds": 45, "weight": 26, "rest_seconds": 60}
+      ]
+    }
+  ]
+}
 ```
-create_strength_workout(
-  name="Back & Shoulders - Pull Heavy",
-  blocks=[
-    {"name": "Main Pull", "rounds": 4, "steps": [
-      {"name": "Lat Pull-down", "reps": 8, "weight": 40, "rest_seconds": 90},
-      {"name": "Seated Cable Row", "reps": 8, "weight": 40, "rest_seconds": 90}
-    ]}
-  ],
-  verify_after_upload=True,
-  verification_mode="lenient"
-)
-```
+
+Use `blocks[].steps`, not `blocks[].exercises`. Use `rounds` on blocks for repeated sets. Rep steps use `reps`; timed steps use `duration_seconds`. Bodyweight exercises such as Pull-up should omit `weight`; do not send `weight: 0` or `weight: null`. For LLM use, keep `verbose=false` unless raw Garmin payloads are needed.
+
+Common strength workflows:
+
+- Create and schedule: `preview_strength_workout` -> `create_strength_workout` -> `schedule_strength_workout` -> `get_scheduled_workouts` -> `get_strength_workout_template`.
+- Replace scheduled workout: `replace_scheduled_strength_workout`, or manually `get_scheduled_workouts` -> `unschedule_strength_workout` -> optional `delete_strength_workout` -> `create_strength_workout` -> `schedule_strength_workout` -> verify.
+- Clone: `clone_strength_workout_template`, optionally with `new_date`.
+- Export and recreate: `export_strength_workout_definition`, modify the returned definition, then `create_strength_workout`.
+- Verify mappings: `search_strength_exercises`, `get_strength_exercise`, `resolve_strength_exercises_bulk`, `roundtrip_verify_strength_exercises`.
+
+ID meanings:
+
+- `workout_id`: reusable template/library workout ID.
+- `scheduled_workout_id`: calendar entry ID used by `unschedule_strength_workout`.
+- `activity_id`: completed activity ID after a scheduled workout is performed.
 
 ### Intentionally Skipped Endpoints
 

@@ -12,7 +12,10 @@ import json
 import logging
 from typing import Any
 
-from garmin_mcp import strength_exercise_catalog
+try:
+    from garmin_mcp import strength_exercise_catalog
+except ModuleNotFoundError:  # pragma: no cover - direct module test import
+    import strength_exercise_catalog  # type: ignore
 
 
 garmin_client = None
@@ -158,6 +161,49 @@ def _compact_response(result: dict[str, Any], fields: list[str] | None = None) -
         compact["status"] = result.get("status", "success")
     
     return compact
+
+
+def _scheduled_workout_id(scheduled: dict[str, Any]) -> int | str | None:
+    for key in (
+        "scheduledWorkoutId",
+        "scheduled_workout_id",
+        "workoutScheduleId",
+        "scheduleId",
+        "calendarWorkoutId",
+        "id",
+    ):
+        if scheduled.get(key) is not None:
+            return scheduled.get(key)
+    return None
+
+
+def _compact_scheduled_workout(scheduled: dict[str, Any]) -> dict[str, Any]:
+    completed = scheduled.get("associatedActivityId") is not None
+    sport = scheduled.get("workoutType") or ((scheduled.get("sportType") or {}).get("sportTypeKey") if isinstance(scheduled.get("sportType"), dict) else None)
+    payload = {
+        "date": scheduled.get("scheduleDate") or scheduled.get("date"),
+        "scheduled_workout_id": _scheduled_workout_id(scheduled),
+        "workout_id": scheduled.get("workoutId") or scheduled.get("workout_id"),
+        "name": scheduled.get("workoutName") or scheduled.get("name"),
+        "sport": sport,
+        "completed": completed,
+    }
+    if completed:
+        payload["activity_id"] = scheduled.get("associatedActivityId")
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _fetch_scheduled_workouts(start_date: str, end_date: str) -> list[dict[str, Any]]:
+    query = {
+        "query": f'query{{workoutScheduleSummariesScalar(startDate:"{start_date}", endDate:"{end_date}")}}'
+    }
+    result = garmin_client.query_garmin_graphql(query)
+    return (result or {}).get("data", {}).get("workoutScheduleSummariesScalar", []) or []
+
+
+def _is_scheduled_strength_workout(scheduled: dict[str, Any]) -> bool:
+    sport = str(scheduled.get("workoutType") or scheduled.get("sport") or "").lower()
+    return sport in {"strength_training", "strength", "strengthtraining"} or "strength" in sport
 
 
 def export_strength_workout_definition(workout_id: int) -> dict[str, Any]:
@@ -673,20 +719,20 @@ def _normalize_weight(set_data: dict[str, Any], exercise: dict[str, Any], path: 
     weight_value = None
     weight_unit = None
     
-    has_explicit_weight_lb = set_data.get("weight_lb") is not None or set_data.get("weight_lbs") is not None
-    has_explicit_weight = set_data.get("weight") is not None or set_data.get("weight_value") is not None or set_data.get("weight_kg") is not None
-    has_explicit_exercise_weight = exercise.get("weight") is not None or exercise.get("weight_value") is not None or exercise.get("weight_kg") is not None
+    has_explicit_weight_lb = "weight_lb" in set_data or "weight_lbs" in set_data
+    has_explicit_weight = "weight" in set_data or "weight_value" in set_data or "weight_kg" in set_data
+    has_explicit_exercise_weight = "weight" in exercise or "weight_value" in exercise or "weight_kg" in exercise
     
     if has_explicit_weight_lb:
-        weight_lb = set_data.get("weight_lb") or set_data.get("weight_lbs")
+        weight_lb = set_data.get("weight_lb") if "weight_lb" in set_data else set_data.get("weight_lbs")
         if weight_lb is None:
-            raise ValueError(f"{path}: weight_lb/weight_lbs is explicitly None; weight must be a number or omitted")
+            raise ValueError(f"{path}: omit weight for bodyweight exercises instead of setting 0/null; otherwise weight must be a number")
         weight_value = float(weight_lb)
         weight_unit = LB_UNIT
     elif has_explicit_weight:
-        weight_val = set_data.get("weight") or set_data.get("weight_value") or set_data.get("weight_kg")
+        weight_val = set_data.get("weight") if "weight" in set_data else (set_data.get("weight_value") if "weight_value" in set_data else set_data.get("weight_kg"))
         if weight_val is None:
-            raise ValueError(f"{path}: weight/weight_value/weight_kg is explicitly None; weight must be a number or omitted")
+            raise ValueError(f"{path}: omit weight for bodyweight exercises instead of setting 0/null; otherwise weight must be a number")
         weight_value = float(weight_val)
         unit_str = str(set_data.get("weight_unit", "kilogram")).lower()
         if unit_str in {"lb", "lbs", "pound", "pounds"}:
@@ -694,9 +740,9 @@ def _normalize_weight(set_data: dict[str, Any], exercise: dict[str, Any], path: 
         else:
             weight_unit = KG_UNIT
     elif has_explicit_exercise_weight:
-        weight_val = exercise.get("weight") or exercise.get("weight_value") or exercise.get("weight_kg")
+        weight_val = exercise.get("weight") if "weight" in exercise else (exercise.get("weight_value") if "weight_value" in exercise else exercise.get("weight_kg"))
         if weight_val is None:
-            raise ValueError(f"{path}: exercise weight is explicitly None; weight must be a number or omitted")
+            raise ValueError(f"{path}: omit weight for bodyweight exercises instead of setting 0/null; otherwise weight must be a number")
         weight_value = float(weight_val)
         unit_str = str(exercise.get("weight_unit", "kilogram")).lower()
         if unit_str in {"lb", "lbs", "pound", "pounds"}:
@@ -746,6 +792,10 @@ def _exercise_step(order: int, exercise: dict[str, Any], set_data: dict[str, Any
         weight_value, weight_unit = _normalize_weight(set_data, exercise, path_for_weight)
     except ValueError as e:
         raise ValueError(str(e))
+    category = str(exercise.get("category") or "").upper()
+    exercise_name = str(exercise.get("exercise_name") or "").upper()
+    if weight_value == 0 and (category in {"PULL_UP", "PUSH_UP"} or exercise_name in {"PULL_UP", "PUSH_UP"}):
+        raise ValueError(f"{path_for_weight}: omit weight for bodyweight exercises instead of setting 0/null")
 
     step = {
         "type": "ExecutableStepDTO",
@@ -897,6 +947,7 @@ def _simple_exercises_to_blocks(exercises: list[dict[str, Any]]) -> list[dict[st
         steps = []
         for set_data in sets:
             step = dict(exercise)
+            step.pop("sets", None)
             step.update(set_data)
             step.setdefault("exercise", exercise.get("exercise") or exercise.get("name") or exercise.get("display_name") or exercise.get("exercise_name"))
             step.setdefault("rest_seconds", set_data.get("rest_seconds", exercise.get("rest_seconds")))
@@ -1033,11 +1084,21 @@ def validate_strength_workout_definition(
         # Check if using the deprecated "exercises" key
         if block.get("exercises") is not None and block.get("steps") is None:
             issues.append({
-                "severity": "warning",
+                "severity": "error",
                 "path": f"{path}.exercises",
-                "message": "Use 'steps' instead of 'exercises' inside blocks. 'exercises' is deprecated but accepted as alias.",
+                "message": f"{path}.exercises: use blocks[].steps, not blocks[].exercises.",
                 "code": "deprecated_key_exercises",
             })
+        for step_index, original_step in enumerate(block.get("steps") or []):
+            if isinstance(original_step, dict) and "sets" in original_step:
+                issues.append(
+                    {
+                        "severity": "error",
+                        "path": f"{path}.steps[{step_index}].sets",
+                        "message": f"{path}.steps[{step_index}].sets: use rounds on the block instead of sets on steps.",
+                        "code": "step_sets_not_supported",
+                    }
+                )
         
         normalized_block = _normalize_block_schema(block, path)
         normalized_blocks.append(normalized_block)
@@ -1079,12 +1140,22 @@ def validate_strength_workout_definition(
                 continue
             exercise_count += 1
             if step.get("reps") is None and step.get("duration_seconds") is None:
-                issues.append({"severity": "error", "path": step_path, "message": f"{step_path}: step needs reps or duration_seconds."})
+                issues.append({"severity": "error", "path": step_path, "message": f"{step_path}.duration_seconds missing; steps require reps or duration_seconds."})
             if step.get("reps") is not None and step.get("duration_seconds") is not None:
                 issues.append({"severity": "error", "path": step_path, "message": "Garmin strength steps should use reps or duration_seconds, not both."})
-            step_weight = step.get("weight") or step.get("weight_value") or step.get("weight_kg") or step.get("weight_lb") or step.get("weight_lbs")
+            explicit_weight_keys = [key for key in ("weight", "weight_value", "weight_kg", "weight_lb", "weight_lbs") if key in step]
+            step_weight = next((step.get(key) for key in explicit_weight_keys if step.get(key) is not None), None)
             step_weight_unit = step.get("weight_unit")
-            if step_weight_unit and not step_weight:
+            if any(step.get(key) is None for key in explicit_weight_keys):
+                bad_key = next(key for key in explicit_weight_keys if step.get(key) is None)
+                issues.append(
+                    {
+                        "severity": "error",
+                        "path": f"{step_path}.{bad_key}",
+                        "message": f"{step_path}.{bad_key}: omit weight for bodyweight exercises instead of setting 0/null; otherwise provide a number.",
+                    }
+                )
+            if step_weight_unit and step_weight in (None, 0):
                 issues.append({"severity": "warning", "path": step_path, "message": "step has weight_unit but no weight value; weight will be ignored."})
             # Only warn about rest step weight if user explicitly provided weight on a rest step
             # We can't know if it's a rest step at validation time, so we'll check in build
@@ -1093,6 +1164,14 @@ def validate_strength_workout_definition(
             if resolved and resolved.get("category") and resolved.get("exercise_name"):
                 exercise_key = str(resolved["exercise_name"]).upper()
                 category = str(resolved["category"]).upper()
+                if step_weight == 0 and (category in {"PULL_UP", "PUSH_UP"} or exercise_key in {"PULL_UP", "PUSH_UP"}):
+                    issues.append(
+                        {
+                            "severity": "error",
+                            "path": f"{step_path}.weight",
+                            "message": f"{step_path}.weight: omit weight for bodyweight exercises instead of setting 0/null",
+                        }
+                    )
                 if category in {"SHOULDER_STABILITY", "PULL_UP", "CORE", "SHOULDER_PRESS"} and not resolved.get("safe_for_exact_tracking"):
                     status = resolved.get("roundtrip_status") or "unknown"
                     if status == "stripped":
@@ -1157,6 +1236,26 @@ def preview_strength_workout_definition(
         for warning in warnings[:10]:
             lines.append(f"  - {warning['message']}")
     compact_validation = _compact_validation(validation, allow_substitutions=allow_substitutions)
+    if compact_validation["upload_ready"]:
+        try:
+            build_strength_workout_payload(
+                name,
+                exercises=exercises,
+                blocks=blocks,
+                description=description,
+                estimated_duration_seconds=estimated_duration_seconds,
+                use_repeat_groups=use_repeat_groups,
+            )
+        except ValueError as exc:
+            validation["issues"].append(
+                {
+                    "severity": "error",
+                    "path": "payload",
+                    "message": f"Local payload construction failed: {exc}",
+                    "code": "payload_construction_failed",
+                }
+            )
+            compact_validation = _compact_validation(validation, allow_substitutions=allow_substitutions)
     summary = _preview_summary(name, blocks, validation, allow_substitutions=allow_substitutions)
     return {
         "status": compact_validation["status"],
@@ -1420,7 +1519,13 @@ def register_tools(app: Any) -> Any:
         include_raw_json: bool = True,
         allow_substitutions: bool = False,
     ) -> str:
-        """Build and validate Garmin strength workout JSON without writing to Garmin Connect. Provide either exercises or grouped blocks."""
+        """Build and validate Garmin strength workout JSON without writing to Garmin Connect.
+
+        Simplified schema: use blocks[].steps, not blocks[].exercises. Use rounds
+        on blocks for repeated sets. Steps use reps or duration_seconds. Weighted
+        steps use weight; bodyweight steps omit weight. Rest is rest_seconds.
+        Example: {"name":"Pull Day","blocks":[{"name":"Carry","rounds":3,"steps":[{"name":"Farmer Carry","duration_seconds":45,"weight":26,"rest_seconds":60}]}]}
+        """
         try:
             preview = preview_strength_workout_definition(name, exercises, blocks, description, estimated_duration_seconds, use_repeat_groups, allow_substitutions)
             if preview["status"] == "error":
@@ -1526,7 +1631,13 @@ def register_tools(app: Any) -> Any:
         use_repeat_groups: bool = True,
         allow_substitutions: bool = False,
     ) -> str:
-        """Return a concise human-readable preview and validation report for a strength workout definition."""
+        """Preview and validate a strength workout using the same local payload path as create.
+
+        Use blocks[].steps, block rounds, reps or duration_seconds, weight for
+        loaded movements, and omit weight for bodyweight. Examples:
+        {"name":"Pull Day","blocks":[{"name":"Pull","rounds":4,"steps":[{"name":"Pull-up","reps":8,"rest_seconds":90}]}]}
+        {"name":"Carry","blocks":[{"name":"Carry","rounds":3,"steps":[{"name":"Farmer Carry","duration_seconds":45,"weight":26,"rest_seconds":60}]}]}
+        """
         try:
             return _json(preview_strength_workout_definition(name, exercises, blocks, description, estimated_duration_seconds, use_repeat_groups, allow_substitutions))
         except Exception as exc:
@@ -1550,7 +1661,12 @@ def register_tools(app: Any) -> Any:
     ) -> str:
         """Create a Garmin strength workout template. verification_mode is strict, compatible, or lenient.
         
-        Set verbose=false for compact output (default). Set verbose=true for full workout details.
+        Set verbose=false for compact output (default). Set verbose=true for full
+        workout details. Use blocks[].steps, not blocks[].exercises. Use rounds
+        on blocks for repeated sets. Timed steps use duration_seconds; rep-based
+        steps use reps; weighted steps use weight; bodyweight steps omit weight.
+        Rest is supplied as rest_seconds on the exercise step.
+        Example: {"name":"Pull Day","verbose":false,"blocks":[{"name":"Pull","rounds":4,"steps":[{"name":"Pull-up","reps":8,"rest_seconds":90},{"name":"Farmer Carry","duration_seconds":45,"weight":26,"rest_seconds":60}]}]}
         """
         try:
             verification_mode = str(verification_mode or "lenient").lower()
@@ -1666,7 +1782,10 @@ def register_tools(app: Any) -> Any:
         cleanup: bool = True,
         update_catalog: bool = False,
     ) -> str:
-        """Empirically upload/fetch strength exercises and report Garmin round-trip preservation."""
+        """Empirically upload/fetch strength exercises and report Garmin round-trip preservation.
+
+        Example: {"exercises":["Pull-up","Face Pull","Farmer Carry"],"cleanup":true}
+        """
         if not isinstance(exercises, list) or not exercises:
             return _error("roundtrip_verify_strength_exercises", "exercises must be a non-empty list of display names.")
         try:
@@ -1762,6 +1881,7 @@ def register_tools(app: Any) -> Any:
         """Schedule an existing Garmin strength workout template on the Garmin calendar.
         
         Set verbose=false for compact output (default). Set verbose=true for full workout details.
+        Example: {"workout_id":1567063109,"date":"2026-05-14","verbose":false}
         """
         try:
             date = _validate_date(date)
@@ -1834,6 +1954,147 @@ def register_tools(app: Any) -> Any:
             })
 
     @app.tool()
+    async def replace_scheduled_strength_workout(
+        date: str,
+        new_workout: dict[str, Any],
+        old_workout_id: int | None = None,
+        scheduled_workout_id: int | None = None,
+        delete_old_template: bool = True,
+        verify: bool = True,
+        verbose: bool = False,
+    ) -> str:
+        """Replace one scheduled strength workout in a single workflow.
+
+        If scheduled_workout_id is omitted, the tool finds strength workouts on date.
+        Multiple matches return a disambiguation error. new_workout accepts the same
+        simplified schema as create_strength_workout: blocks[].steps, block rounds,
+        reps or duration_seconds, optional weight, and rest_seconds.
+        Example:
+        {"date":"2026-05-14","new_workout":{"name":"Pull Heavy v2","blocks":[{"name":"Carry","rounds":3,"steps":[{"name":"Farmer Carry","duration_seconds":45,"weight":26,"rest_seconds":60}]}]}}
+        """
+        warnings: list[str] = []
+        try:
+            date = _validate_date(date)
+            if not isinstance(new_workout, dict):
+                return _error("replace_scheduled_strength_workout", "new_workout must be an object accepted by create_strength_workout.")
+
+            scheduled_items = _fetch_scheduled_workouts(date, date)
+            candidates = [_compact_scheduled_workout(item) for item in scheduled_items if _is_scheduled_strength_workout(item)]
+            if old_workout_id is not None:
+                candidates = [item for item in candidates if int(item.get("workout_id") or 0) == int(old_workout_id)]
+            if scheduled_workout_id is not None:
+                candidates = [item for item in candidates if str(item.get("scheduled_workout_id")) == str(scheduled_workout_id)]
+                if not candidates:
+                    candidates = [{"date": date, "scheduled_workout_id": scheduled_workout_id, "workout_id": old_workout_id}]
+
+            if scheduled_workout_id is None and len(candidates) != 1:
+                return _json(
+                    {
+                        "status": "error",
+                        "tool": "replace_scheduled_strength_workout",
+                        "message": "Could not identify exactly one scheduled strength workout. Re-run with scheduled_workout_id.",
+                        "date": date,
+                        "candidate_count": len(candidates),
+                        "candidates": candidates[:10],
+                    }
+                )
+
+            old = candidates[0]
+            old_schedule_id = old.get("scheduled_workout_id") or scheduled_workout_id
+            old_template_id = old.get("workout_id") or old_workout_id
+            if old_schedule_id is None:
+                return _error("replace_scheduled_strength_workout", "Selected scheduled workout does not include scheduled_workout_id; cannot unschedule safely.", candidates=candidates)
+
+            name = new_workout.get("name")
+            blocks = new_workout.get("blocks")
+            exercises = new_workout.get("exercises")
+            description = new_workout.get("description")
+            estimated_duration_seconds = new_workout.get("estimated_duration_seconds")
+            use_repeat_groups = bool(new_workout.get("use_repeat_groups", True))
+            allow_substitutions = bool(new_workout.get("allow_substitutions", False))
+
+            preview = preview_strength_workout_definition(
+                name,
+                exercises=exercises,
+                blocks=blocks,
+                description=description,
+                estimated_duration_seconds=estimated_duration_seconds,
+                use_repeat_groups=use_repeat_groups,
+                allow_substitutions=allow_substitutions,
+            )
+            if preview["status"] == "error":
+                return _json({"status": "error", "message": "New workout validation failed; no Garmin changes were made.", **preview})
+            payload = build_strength_workout_payload(
+                name,
+                exercises=exercises,
+                blocks=blocks,
+                description=description,
+                estimated_duration_seconds=estimated_duration_seconds,
+                use_repeat_groups=use_repeat_groups,
+            )
+
+            unschedule_result = _call_delete(f"{garmin_client.garmin_workouts_schedule_url}/{int(old_schedule_id)}")
+            delete_result = None
+            if delete_old_template and old_template_id is not None:
+                delete_result = _delete_workout_by_id(int(old_template_id))
+
+            create_result = garmin_client.upload_workout(payload)
+            new_workout_id = create_result.get("workoutId") if isinstance(create_result, dict) else None
+            if not new_workout_id:
+                return _error(
+                    "replace_scheduled_strength_workout",
+                    "Old scheduled workout was removed, but Garmin did not return workoutId for the replacement.",
+                    removed=old,
+                    create_result=create_result,
+                )
+            schedule_result = _call_post(f"{garmin_client.garmin_workouts_schedule_url}/{int(new_workout_id)}", {"date": date})
+
+            verified = False
+            verification: dict[str, Any] | None = None
+            if verify:
+                scheduled_after = [_compact_scheduled_workout(item) for item in _fetch_scheduled_workouts(date, date)]
+                template = garmin_client.get_workout_by_id(int(new_workout_id))
+                verified = any(str(item.get("workout_id")) == str(new_workout_id) for item in scheduled_after) and bool(template)
+                verification = {
+                    "scheduled_match": any(str(item.get("workout_id")) == str(new_workout_id) for item in scheduled_after),
+                    "template_found": bool(template),
+                    "scheduled_workouts": scheduled_after,
+                    "workout": _curate_strength_workout(template, include_steps=verbose) if isinstance(template, dict) else None,
+                }
+                if not verified:
+                    warnings.append("Replacement was attempted, but verification did not find both the scheduled entry and template.")
+
+            response = {
+                "status": "success",
+                "removed": {
+                    "scheduled_workout_id": old_schedule_id,
+                    "workout_id": old_template_id,
+                    "name": old.get("name"),
+                },
+                "created": {
+                    "workout_id": new_workout_id,
+                    "name": create_result.get("workoutName") if isinstance(create_result, dict) else name,
+                },
+                "scheduled": {"date": date},
+                "verified": bool(verified) if verify else None,
+                "warnings": warnings,
+            }
+            if verbose:
+                response.update(
+                    {
+                        "unschedule_result": _response_payload(unschedule_result),
+                        "delete_result": _response_payload(delete_result) if delete_result is not None else None,
+                        "create_result": create_result,
+                        "schedule_result": _response_payload(schedule_result),
+                        "verification": verification,
+                    }
+                )
+            return _json({key: value for key, value in response.items() if value is not None})
+        except Exception as exc:
+            logger.info("strength_workout_replace_failed: %s", type(exc).__name__)
+            return _error("replace_scheduled_strength_workout", f"Garmin strength workout replacement failed: {exc}")
+
+    @app.tool()
     async def export_strength_workout_definition(workout_id: int) -> str:
         """Export a Garmin strength workout as a simplified definition for recreation.
         
@@ -1847,25 +2108,17 @@ def register_tools(app: Any) -> Any:
             logger.info("strength_workout_export_failed: %s", type(exc).__name__)
             return _error("export_strength_workout_definition", f"Failed to export workout: {exc}")
 
-    @app.tool()
-    async def unschedule_strength_workout(scheduled_workout_id: int, confirmation: str = "") -> str:
-        """Remove a scheduled workout from the Garmin calendar. Requires confirmation='UNSCHEDULE_STRENGTH_WORKOUT'."""
-        if confirmation != "UNSCHEDULE_STRENGTH_WORKOUT":
-            return _error(
-                "unschedule_strength_workout",
-                "Explicit confirmation required. Re-run with confirmation='UNSCHEDULE_STRENGTH_WORKOUT'.",
-            )
-        try:
-            url = f"{garmin_client.garmin_workouts_schedule_url}/{int(scheduled_workout_id)}"
-            result = _call_delete(url)
-            return _json({"status": "success", "message": "Scheduled workout removed from calendar.", "scheduled_workout_id": scheduled_workout_id, "result": _response_payload(result)})
-        except Exception as exc:
-            logger.info("strength_workout_unschedule_failed: %s", type(exc).__name__)
-            return _error("unschedule_strength_workout", f"Garmin strength workout unscheduling failed: {exc}")
+    # NOTE: The former `unschedule_strength_workout` tool has been removed.
+    # Use the generic, sport-agnostic `unschedule_workout` tool exposed by the
+    # workouts module instead. It works for running, cycling, strength, cardio,
+    # and walking calendar entries and uses confirmation='UNSCHEDULE_WORKOUT'.
 
     @app.tool()
-    async def delete_strength_workout(workout_id: int, confirmation: str = "") -> str:
-        """Delete a strength workout template from Garmin Connect. Requires confirmation='DELETE_STRENGTH_WORKOUT'."""
+    async def delete_strength_workout(workout_id: int, confirmation: str = "", verbose: bool = False) -> str:
+        """Delete a strength workout template from Garmin Connect. Requires confirmation='DELETE_STRENGTH_WORKOUT'.
+
+        Example: {"workout_id":1567063109,"confirmation":"DELETE_STRENGTH_WORKOUT"}
+        """
         if confirmation != "DELETE_STRENGTH_WORKOUT":
             return _error(
                 "delete_strength_workout",
@@ -1878,7 +2131,10 @@ def register_tools(app: Any) -> Any:
                 return _error("delete_strength_workout", f"Workout {workout_id} is sport '{sport}', not strength_training.")
             url = f"{garmin_client.garmin_workouts}/workout/{int(workout_id)}"
             result = _call_delete(url)
-            return _json({"status": "success", "message": "Strength workout template deleted.", "workout_id": workout_id, "result": _response_payload(result)})
+            response = {"status": "success", "message": "Strength workout template deleted.", "workout_id": workout_id, "result": _response_payload(result)}
+            if not verbose:
+                response.pop("result", None)
+            return _json(response)
         except Exception as exc:
             logger.info("strength_workout_delete_failed: %s", type(exc).__name__)
             return _error("delete_strength_workout", f"Garmin strength workout deletion failed: {exc}")
