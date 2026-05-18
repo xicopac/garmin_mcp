@@ -199,8 +199,10 @@ def _workouts_topic_payload(verbose: bool = False) -> dict[str, Any]:
             "validate_running_workout",
             "preview_running_workout",
             "create_running_workout",
+            "update_running_workout",
             "upload_workout",
             "upload_workouts",
+            "update_workout_template",
             "schedule_workouts",
             "get_workouts",
             "get_workout_by_id",
@@ -219,6 +221,19 @@ def _workouts_topic_payload(verbose: bool = False) -> dict[str, Any]:
                     "create_running_workout builds the canonical DTOs for you and uploads.",
                     "If you must build JSON by hand, preview/validate first to catch DTO mismatches.",
                     "Set dry_run=true on create_running_workout to inspect the payload without uploading.",
+                ],
+            ),
+            _workflow(
+                "Update an existing running workout template in place",
+                [
+                    "get_workout_by_id",
+                    "update_running_workout",
+                    "get_workout_by_id",
+                ],
+                [
+                    "update_running_workout preserves the same workout_id and does not unschedule/reschedule calendar entries.",
+                    "Use dry_run=true first to inspect the generated payload and validation report.",
+                    "The tool refuses sport mismatches and verifies the fetched template after update by default.",
                 ],
             ),
             _workflow(
@@ -452,6 +467,23 @@ def recommend_tools_for_intent(intent: str) -> dict[str, Any]:
                 "create_running_workout builds canonical Garmin DTOs and uploads in one call.",
                 "Use dry_run=true to inspect the payload first.",
                 "For pace targets, use explicit unit keys such as pace_min_per_km=[5.0, 5.5] or pace_seconds_per_km=[300, 330]; raw Garmin pace.zone values are m/s.",
+            ],
+        }
+    if ("update" in normalized or "edit" in normalized or "modify" in normalized) and (
+        "workout" in normalized or "template" in normalized or "run" in normalized or "running" in normalized
+    ):
+        return {
+            "intent": "update existing workout template in place",
+            "recommended_sequence": [
+                "get_workout_by_id",
+                "update_running_workout" if ("run" in normalized or "running" in normalized) else "update_workout_template",
+                "get_workout_by_id",
+            ],
+            "single_tool_shortcut": "update_running_workout" if ("run" in normalized or "running" in normalized) else "update_workout_template",
+            "notes": [
+                "These tools preserve the existing workout_id and do not touch calendar rows.",
+                "Use dry_run=true with update_running_workout to inspect the generated payload before updating Garmin.",
+                "Sport mismatches are refused by default.",
             ],
         }
     if "refresh" in normalized or "rebuild" in normalized or "calendar" in normalized:

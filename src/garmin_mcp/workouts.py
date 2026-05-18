@@ -1,6 +1,7 @@
 """
 Workout-related functions for Garmin Connect MCP Server
 """
+import copy
 import json
 import re
 import time
@@ -185,6 +186,312 @@ def _summarize_workout(workout_data: Any) -> Dict[str, Any]:
             "steps": _summarize_steps(first.get("workoutSteps")),
         }
     return summary
+
+
+def _sport_key(workout_data: Any) -> Optional[str]:
+    """Return the Garmin sportTypeKey from a workout-like payload."""
+    if not isinstance(workout_data, dict):
+        return None
+    sport = workout_data.get("sportType")
+    if isinstance(sport, dict):
+        key = sport.get("sportTypeKey")
+        return key if isinstance(key, str) and key else None
+    return None
+
+
+def _workout_id_from_payload(workout_data: Any) -> Optional[int]:
+    """Extract a numeric workoutId from Garmin's common response shapes."""
+    if not isinstance(workout_data, dict):
+        return None
+    for key in ("workoutId", "workout_id", "id"):
+        value = workout_data.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _step_signature(step: Any) -> Dict[str, Any]:
+    """Comparable, sanitized step signature for update verification."""
+    if not isinstance(step, dict):
+        return {"invalid_step_type": type(step).__name__}
+    step_type = step.get("stepType") if isinstance(step.get("stepType"), dict) else {}
+    end_condition = step.get("endCondition") if isinstance(step.get("endCondition"), dict) else {}
+    target = step.get("targetType") if isinstance(step.get("targetType"), dict) else {}
+
+    signature: Dict[str, Any] = {
+        "dto": step.get("type"),
+        "order": step.get("stepOrder"),
+    }
+    if step_type:
+        signature["type"] = step_type.get("stepTypeKey")
+    if end_condition:
+        signature["end_condition"] = end_condition.get("conditionTypeKey")
+    if step.get("endConditionValue") is not None:
+        signature["end_condition_value"] = step.get("endConditionValue")
+    if target:
+        signature["target_type"] = target.get("workoutTargetTypeKey")
+    for key in ("zoneNumber", "targetValueOne", "targetValueTwo"):
+        if step.get(key) is not None:
+            signature[key] = step.get(key)
+    if step.get("type") == "RepeatGroupDTO":
+        signature["repeat_count"] = step.get("numberOfIterations")
+        signature["steps"] = [_step_signature(child) for child in step.get("workoutSteps") or []]
+    return {k: v for k, v in signature.items() if v is not None}
+
+
+def _workout_update_summary(workout_data: Any) -> Dict[str, Any]:
+    """Comparable workout summary for in-place update verification."""
+    if not isinstance(workout_data, dict):
+        return {"valid": False, "type": type(workout_data).__name__}
+
+    segments = workout_data.get("workoutSegments") or []
+    summary: Dict[str, Any] = {
+        "workout_id": _workout_id_from_payload(workout_data),
+        "name": workout_data.get("workoutName"),
+        "description": workout_data.get("description"),
+        "sport": _sport_key(workout_data),
+        "segment_count": len(segments) if isinstance(segments, list) else None,
+        "segments": [],
+    }
+    if isinstance(segments, list):
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            steps = segment.get("workoutSteps") or []
+            segment_sport = segment.get("sportType") if isinstance(segment.get("sportType"), dict) else {}
+            summary["segments"].append({
+                "order": segment.get("segmentOrder"),
+                "sport": segment_sport.get("sportTypeKey"),
+                "step_count": len(steps) if isinstance(steps, list) else None,
+                "steps": [_step_signature(step) for step in steps] if isinstance(steps, list) else [],
+            })
+    return {k: v for k, v in summary.items() if v is not None}
+
+
+def _response_summary(response: Any) -> Dict[str, Any]:
+    """Return a JSON-safe summary of a Garmin update response."""
+    if isinstance(response, dict):
+        return {
+            k: v
+            for k, v in {
+                "type": "dict",
+                "workout_id": _workout_id_from_payload(response),
+                "name": response.get("workoutName"),
+                "sport": _sport_key(response),
+                "keys": sorted(response.keys()),
+            }.items()
+            if v is not None
+        }
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        summary: Dict[str, Any] = {"type": type(response).__name__, "http_status": status}
+        try:
+            body = response.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            summary["body_workout_id"] = _workout_id_from_payload(body)
+            summary["body_keys"] = sorted(body.keys())
+        return {k: v for k, v in summary.items() if v is not None}
+    if response is None:
+        return {"type": "none"}
+    return {"type": type(response).__name__, "repr": repr(response)[:500]}
+
+
+def _merge_workout_update(existing: Dict[str, Any], requested: Dict[str, Any], workout_id: int) -> Dict[str, Any]:
+    """Merge caller-supplied workout fields into Garmin's existing full template.
+
+    Garmin's update endpoint expects a full workout-shaped payload. Builders only
+    produce the editable core fields, so preserve any Garmin metadata that came
+    back from get_workout_by_id while replacing explicit caller fields.
+    """
+    merged = copy.deepcopy(existing)
+    for key, value in requested.items():
+        merged[key] = copy.deepcopy(value)
+    merged["workoutId"] = int(workout_id)
+    return merged
+
+
+def _put_workout_template(client: Any, workout_id: int, payload: Dict[str, Any]) -> Any:
+    """Update a Garmin workout template in place using the authenticated client."""
+    update_method = None
+    if "update_workout" in getattr(client, "__dict__", {}) or hasattr(type(client), "update_workout"):
+        update_method = getattr(client, "update_workout", None)
+    if callable(update_method):
+        return update_method(int(workout_id), payload)
+
+    http_client = getattr(client, "client", None)
+    put = getattr(http_client, "put", None) if http_client is not None else None
+    if not callable(put):
+        raise RuntimeError(
+            "Garmin client does not expose update_workout or client.put; "
+            "template update is not supported by this client."
+        )
+
+    base = getattr(client, "garmin_workouts", "workout-service")
+    if not isinstance(base, str) or not base:
+        base = "workout-service"
+    url = f"{base}/workout/{int(workout_id)}"
+    return put("connectapi", url, json=payload, api=True)
+
+
+def update_workout_template_payload(
+    client: Any,
+    workout_id: int,
+    workout_data: Dict[str, Any],
+    *,
+    verify_after_update: bool = True,
+    verbose: bool = False,
+    validation_report: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Update an existing Garmin workout template in place.
+
+    This helper intentionally mutates only the workout template endpoint. It
+    never touches schedule/calendar endpoints and never deletes templates or
+    historical data.
+    """
+    warnings: List[str] = []
+    wid = int(workout_id)
+    if not isinstance(workout_data, dict):
+        return {
+            "status": "error",
+            "workout_id": wid,
+            "message": "workout_data must be a JSON object",
+            "warnings": warnings,
+        }
+
+    try:
+        existing = client.get_workout_by_id(wid)
+    except Exception as exc:
+        return build_garmin_api_error(
+            exc,
+            operation="get_workout_by_id",
+            endpoint=f"/workout-service/workout/{wid}",
+            method="GET",
+            extra={"workout_id": wid, "warnings": warnings},
+        )
+
+    if not isinstance(existing, dict) or not existing:
+        return {
+            "status": "error",
+            "workout_id": wid,
+            "message": f"No workout template found with ID {wid}.",
+            "warnings": warnings,
+        }
+    existing_id = _workout_id_from_payload(existing)
+    if existing_id is not None and existing_id != wid:
+        return {
+            "status": "error",
+            "workout_id": wid,
+            "message": f"Fetched workout ID {existing_id} did not match requested workout_id {wid}.",
+            "before_summary": _workout_update_summary(existing),
+            "warnings": warnings,
+        }
+    if existing.get("associatedActivityId") is not None:
+        return {
+            "status": "error",
+            "workout_id": wid,
+            "message": "Refusing to update a completed activity; update_workout_template only updates templates.",
+            "before_summary": _workout_update_summary(existing),
+            "warnings": warnings,
+        }
+
+    existing_sport = _sport_key(existing)
+    requested_sport = _sport_key(workout_data)
+    if existing_sport and requested_sport and existing_sport != requested_sport:
+        return {
+            "status": "error",
+            "workout_id": wid,
+            "message": (
+                f"Refusing sport mismatch: existing workout sport is {existing_sport!r}, "
+                f"requested sport is {requested_sport!r}."
+            ),
+            "before_summary": _workout_update_summary(existing),
+            "requested_summary": _workout_update_summary(workout_data),
+            "validation_report": validation_report,
+            "warnings": warnings,
+        }
+
+    _fix_hr_zone_steps(workout_data)
+    payload = _merge_workout_update(existing, workout_data, wid)
+    before_summary = _workout_update_summary(existing)
+    requested_summary = _workout_update_summary(payload)
+
+    try:
+        response = _put_workout_template(client, wid, payload)
+    except Exception as exc:
+        return build_garmin_api_error(
+            exc,
+            operation="update_workout_template",
+            endpoint=f"/workout-service/workout/{wid}",
+            method="PUT",
+            workout_data=payload,
+            extra={
+                "workout_id": wid,
+                "before_summary": before_summary,
+                "validation_report": validation_report,
+                "warnings": warnings,
+            },
+        )
+
+    status_code = getattr(response, "status_code", None)
+    if isinstance(status_code, int) and status_code >= 400:
+        return {
+            "status": "error",
+            "workout_id": wid,
+            "message": f"Garmin update failed with HTTP {status_code}.",
+            "before_summary": before_summary,
+            "validation_report": validation_report,
+            "garmin_response_summary": _response_summary(response),
+            "warnings": warnings,
+        }
+
+    after = None
+    after_summary = None
+    verification_issues: List[str] = []
+    if verify_after_update:
+        try:
+            after = client.get_workout_by_id(wid)
+        except Exception as exc:
+            return build_garmin_api_error(
+                exc,
+                operation="verify_update_workout_template",
+                endpoint=f"/workout-service/workout/{wid}",
+                method="GET",
+                extra={
+                    "workout_id": wid,
+                    "before_summary": before_summary,
+                    "requested_summary": requested_summary,
+                    "validation_report": validation_report,
+                    "garmin_response_summary": _response_summary(response),
+                    "warnings": warnings,
+                },
+            )
+        after_summary = _workout_update_summary(after)
+        if after_summary.get("workout_id") != wid:
+            verification_issues.append("workout_id changed or was missing after update")
+        for field in ("name", "sport", "description", "segment_count", "segments"):
+            if after_summary.get(field) != requested_summary.get(field):
+                verification_issues.append(f"{field} did not match requested payload after update")
+
+    result: Dict[str, Any] = {
+        "status": "partial" if verification_issues else "success",
+        "workout_id": wid,
+        "before_summary": before_summary,
+        "after_summary": after_summary or requested_summary,
+        "validation_report": validation_report,
+        "garmin_response_summary": _response_summary(response),
+        "warnings": warnings + verification_issues,
+    }
+    if verbose:
+        result["requested_payload"] = payload
+        if after is not None:
+            result["after_workout"] = after
+    return result
 
 
 def _exception_chain(exc: BaseException) -> List[Dict[str, str]]:
@@ -1069,6 +1376,45 @@ def register_tools(app):
             "failed": total - succeeded,
             "results": results
         }, indent=2)
+
+    @app.tool()
+    async def update_workout_template(
+        workout_id: int,
+        workout_data: dict,
+        verify_after_update: bool = True,
+        verbose: bool = False,
+    ) -> str:
+        """Update an existing Garmin workout template in place.
+
+        This updates the Garmin Connect workout template identified by
+        workout_id using a PUT-style template update. It preserves the same
+        workout_id and does not touch scheduled calendar entries, completed
+        activities, health data, gear, goals, badges, body composition, or
+        nutrition logs.
+
+        Safety behavior:
+        - Fetches the existing workout first and refuses missing/non-template data.
+        - Refuses sport mismatches between existing and requested payload.
+        - Preserves Garmin fields from the existing template that are absent from
+          workout_data.
+        - Never calls schedule, unschedule, refresh, or delete endpoints.
+
+        Args:
+            workout_id: Existing Garmin workout template ID.
+            workout_data: Full or partial workout-shaped payload containing the
+                          requested template fields/segments.
+            verify_after_update: Fetch after update and compare identity/name/
+                                 sport/description/segment/step structure.
+            verbose: Include requested payload and fetched after-workout details.
+        """
+        result = update_workout_template_payload(
+            garmin_client,
+            workout_id,
+            workout_data,
+            verify_after_update=verify_after_update,
+            verbose=verbose,
+        )
+        return json.dumps(result, indent=2, default=str)
 
     @app.tool()
     async def validate_running_workout(workout_data: dict) -> str:

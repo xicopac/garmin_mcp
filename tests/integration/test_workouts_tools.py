@@ -7,7 +7,7 @@ import pytest
 from unittest.mock import Mock
 from mcp.server.fastmcp import FastMCP
 
-from garmin_mcp import workouts
+from garmin_mcp import workout_builders, workouts
 from tests.fixtures.garmin_responses import (
     MOCK_WORKOUTS,
     MOCK_WORKOUT_DETAILS,
@@ -21,6 +21,15 @@ def app_with_workouts(mock_garmin_client):
     workouts.configure(mock_garmin_client)
     app = FastMCP("Test Workouts")
     app = workouts.register_tools(app)
+    return app
+
+
+@pytest.fixture
+def app_with_workout_builders(mock_garmin_client):
+    """Create FastMCP app with high-level workout builder tools registered"""
+    workout_builders.configure(mock_garmin_client)
+    app = FastMCP("Test Workout Builders")
+    app = workout_builders.register_tools(app)
     return app
 
 
@@ -1117,6 +1126,70 @@ def _tempo_blocks_payload():
     }
 
 
+def _sprint_primer_payload(repeats=4, name="GPT Sprint Primer Run", description=None):
+    payload = {
+        "workoutId": 1567175577,
+        "workoutName": name,
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+            "workoutSteps": [
+                {"type": "ExecutableStepDTO", "stepOrder": 1,
+                 "stepType": {"stepTypeId": 1, "stepTypeKey": "warmup"},
+                 "description": "1 km easy",
+                 "endCondition": {"conditionTypeId": 3, "conditionTypeKey": "distance"},
+                 "endConditionValue": 1000.0,
+                 "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}},
+                {"type": "RepeatGroupDTO", "stepOrder": 2, "numberOfIterations": repeats,
+                 "workoutSteps": [
+                     {"type": "ExecutableStepDTO", "stepOrder": 1,
+                      "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+                      "description": "15 sec fast relaxed",
+                      "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                      "endConditionValue": 15.0,
+                      "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}},
+                     {"type": "ExecutableStepDTO", "stepOrder": 2,
+                      "stepType": {"stepTypeId": 4, "stepTypeKey": "recovery"},
+                      "description": "90 sec walk/jog",
+                      "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                      "endConditionValue": 90.0,
+                      "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}}]},
+            ],
+        }],
+    }
+    if description is not None:
+        payload["description"] = description
+    return payload
+
+
+def _sprint_primer_steps(repeats=6):
+    return [
+        {
+            "kind": "warmup",
+            "distance_meters": 1000,
+            "description": "1 km easy",
+        },
+        {
+            "repeat": {
+                "iterations": repeats,
+                "steps": [
+                    {
+                        "kind": "interval",
+                        "duration_seconds": 15,
+                        "description": "15 sec fast relaxed",
+                    },
+                    {
+                        "kind": "recovery",
+                        "duration_seconds": 90,
+                        "description": "90 sec walk/jog",
+                    },
+                ],
+            }
+        },
+    ]
+
+
 @pytest.mark.asyncio
 async def test_upload_workout_progression_run_uploads(app_with_workouts, mock_garmin_client):
     """Acceptance: a progression run with warmup/cooldown uploads successfully."""
@@ -1352,3 +1425,171 @@ async def test_preview_running_workout_tool_includes_schema_on_invalid(app_with_
     assert "expected_step_types" in data
     assert data["expected_step_types"]["interval"] == 3
     assert data["expected_step_types"]["recovery"] == 4
+
+
+@pytest.mark.asyncio
+async def test_update_running_workout_dry_run_builds_and_validates_without_garmin(
+    app_with_workout_builders, mock_garmin_client
+):
+    import json as json_module
+
+    result = await app_with_workout_builders.call_tool(
+        "update_running_workout",
+        {
+            "workout_id": 1567175577,
+            "name": "GPT Sprint Primer Run",
+            "steps": _sprint_primer_steps(repeats=6),
+            "dry_run": True,
+        },
+    )
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "dry_run"
+    assert data["workout_id"] == 1567175577
+    assert data["validation_report"]["ok"] is True
+    repeat = data["workout_json"]["workoutSegments"][0]["workoutSteps"][1]
+    assert repeat["numberOfIterations"] == 6
+    mock_garmin_client.get_workout_by_id.assert_not_called()
+    mock_garmin_client.upload_workout.assert_not_called()
+    mock_garmin_client.client.post.assert_not_called()
+    mock_garmin_client.client.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_running_workout_updates_repeat_count_in_place_and_preserves_id(
+    app_with_workout_builders, mock_garmin_client
+):
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    description = (
+        "Run outside before gym: 1 km easy steady, then 6 x 15 sec fast "
+        "relaxed sprint-backs with 90 sec walk/jog recovery. Stop while sharp. "
+        "Go directly to gym. No treadmill."
+    )
+    before = _sprint_primer_payload(repeats=4)
+    after = _sprint_primer_payload(repeats=6, description=description)
+    mock_garmin_client.get_workout_by_id.side_effect = [before, after]
+    mock_garmin_client.garmin_workouts = "workout-service"
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"workoutId": 1567175577}
+    mock_garmin_client.client.put.return_value = response
+
+    result = await app_with_workout_builders.call_tool(
+        "update_running_workout",
+        {
+            "workout_id": 1567175577,
+            "name": "GPT Sprint Primer Run",
+            "description": description,
+            "steps": _sprint_primer_steps(repeats=6),
+        },
+    )
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "success"
+    assert data["workout_id"] == 1567175577
+    assert data["before_summary"]["segments"][0]["steps"][1]["repeat_count"] == 4
+    assert data["after_summary"]["segments"][0]["steps"][1]["repeat_count"] == 6
+    put_payload = mock_garmin_client.client.put.call_args.kwargs["json"]
+    assert put_payload["workoutId"] == 1567175577
+    assert put_payload["workoutSegments"][0]["workoutSteps"][1]["numberOfIterations"] == 6
+    mock_garmin_client.upload_workout.assert_not_called()
+    mock_garmin_client.client.post.assert_not_called()
+    mock_garmin_client.client.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_workout_template_refuses_sport_mismatch(app_with_workouts, mock_garmin_client):
+    import json as json_module
+
+    mock_garmin_client.get_workout_by_id.return_value = _sprint_primer_payload(repeats=4)
+
+    cycling_payload = {
+        "workoutName": "Bike",
+        "sportType": {"sportTypeId": 2, "sportTypeKey": "cycling"},
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 2, "sportTypeKey": "cycling"},
+            "workoutSteps": [],
+        }],
+    }
+    result = await app_with_workouts.call_tool(
+        "update_workout_template",
+        {"workout_id": 1567175577, "workout_data": cycling_payload},
+    )
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "error"
+    assert "sport mismatch" in data["message"]
+    mock_garmin_client.client.put.assert_not_called()
+    mock_garmin_client.client.post.assert_not_called()
+    mock_garmin_client.client.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_workout_template_preserves_id_and_does_not_mutate_calendar(
+    app_with_workouts, mock_garmin_client
+):
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    before = _sprint_primer_payload(repeats=4)
+    after = _sprint_primer_payload(repeats=6)
+    mock_garmin_client.get_workout_by_id.side_effect = [before, after]
+    mock_garmin_client.garmin_workouts = "workout-service"
+    response = MagicMock()
+    response.status_code = 204
+    response.json.side_effect = ValueError("no body")
+    mock_garmin_client.client.put.return_value = response
+
+    requested = _sprint_primer_payload(repeats=6)
+    requested.pop("workoutId")
+    result = await app_with_workouts.call_tool(
+        "update_workout_template",
+        {"workout_id": 1567175577, "workout_data": requested},
+    )
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "success"
+    assert data["workout_id"] == 1567175577
+    assert mock_garmin_client.client.put.call_args.args[:2] == (
+        "connectapi",
+        "workout-service/workout/1567175577",
+    )
+    assert mock_garmin_client.client.put.call_args.kwargs["json"]["workoutId"] == 1567175577
+    mock_garmin_client.client.post.assert_not_called()
+    mock_garmin_client.client.delete.assert_not_called()
+    mock_garmin_client.upload_workout.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_workout_template_verification_failure_returns_partial(
+    app_with_workouts, mock_garmin_client
+):
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    before = _sprint_primer_payload(repeats=4)
+    after_still_old = _sprint_primer_payload(repeats=4)
+    mock_garmin_client.get_workout_by_id.side_effect = [before, after_still_old]
+    mock_garmin_client.garmin_workouts = "workout-service"
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"workoutId": 1567175577}
+    mock_garmin_client.client.put.return_value = response
+
+    requested = _sprint_primer_payload(repeats=6)
+    requested.pop("workoutId")
+    result = await app_with_workouts.call_tool(
+        "update_workout_template",
+        {"workout_id": 1567175577, "workout_data": requested},
+    )
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "partial"
+    assert any("segments did not match" in warning for warning in data["warnings"])
+    assert data["before_summary"]["segments"][0]["steps"][1]["repeat_count"] == 4
+    assert data["after_summary"]["segments"][0]["steps"][1]["repeat_count"] == 4
+    mock_garmin_client.client.delete.assert_not_called()
+    mock_garmin_client.client.post.assert_not_called()

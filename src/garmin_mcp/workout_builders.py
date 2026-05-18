@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from garmin_mcp.workouts import (
     build_garmin_api_error,
+    update_workout_template_payload,
     validate_running_workout_data,
 )
 
@@ -784,6 +785,118 @@ def register_tools(app):
             }
             return json.dumps({k: v for k, v in curated.items() if v is not None}, indent=2)
         return json.dumps(result, indent=2)
+
+    @app.tool()
+    async def update_running_workout(
+        workout_id: int,
+        steps: List[Dict[str, Any]],
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        verify_after_update: bool = True,
+        dry_run: bool = False,
+        verbose: bool = False,
+    ) -> str:
+        """Update an existing Garmin running workout template in place.
+
+        Builds the same canonical Garmin running JSON as create_running_workout,
+        validates it locally, then updates the existing template without
+        deleting/recreating the template and without touching calendar entries.
+
+        Args:
+            workout_id: Existing Garmin workout template ID to update.
+            name: Optional replacement name. If omitted for a real update, the
+                  existing template name is preserved. Dry runs use a placeholder
+                  name when omitted because they do not contact Garmin.
+            description: Optional replacement description.
+            steps: High-level running step list accepted by create_running_workout.
+            verify_after_update: Fetch after update and verify the template.
+            dry_run: Build and validate only; do not contact Garmin.
+            verbose: Include requested payload and fetched after-workout details.
+        """
+        effective_name = name
+        if effective_name is None and not dry_run:
+            try:
+                existing = garmin_client.get_workout_by_id(int(workout_id))
+            except Exception as fetch_exc:
+                return json.dumps(
+                    build_garmin_api_error(
+                        fetch_exc,
+                        operation="get_workout_by_id",
+                        endpoint=f"/workout-service/workout/{int(workout_id)}",
+                        method="GET",
+                        extra={"workout_id": int(workout_id)},
+                    ),
+                    indent=2,
+                )
+            if not isinstance(existing, dict) or not existing:
+                return json.dumps(
+                    {
+                        "status": "error",
+                        "workout_id": int(workout_id),
+                        "message": f"No workout template found with ID {int(workout_id)}.",
+                    },
+                    indent=2,
+                )
+            effective_name = existing.get("workoutName")
+        if effective_name is None:
+            effective_name = f"Workout {int(workout_id)}"
+
+        try:
+            workout_json = build_running_workout_json(
+                effective_name,
+                steps,
+                description=description,
+            )
+        except Exception as build_exc:
+            return json.dumps(
+                {
+                    "status": "error",
+                    "operation": "build_running_workout_json",
+                    "workout_id": int(workout_id),
+                    "error_type": type(build_exc).__name__,
+                    "message": str(build_exc),
+                },
+                indent=2,
+            )
+
+        report = validate_running_workout_data(workout_json)
+        if not report["ok"]:
+            return json.dumps(
+                {
+                    "status": "invalid",
+                    "operation": "validate_running_workout",
+                    "workout_id": int(workout_id),
+                    "message": "Built workout failed local validation; not updating.",
+                    "issues": report["issues"],
+                    "validation_report": report,
+                    "workout_json": workout_json,
+                    "summary": report["summary"],
+                },
+                indent=2,
+            )
+
+        if dry_run:
+            return json.dumps(
+                {
+                    "status": "dry_run",
+                    "workout_id": int(workout_id),
+                    "valid": True,
+                    "validation_report": report,
+                    "summary": report["summary"],
+                    "workout_json": workout_json,
+                },
+                indent=2,
+            )
+
+        result = update_workout_template_payload(
+            garmin_client,
+            int(workout_id),
+            workout_json,
+            verify_after_update=verify_after_update,
+            verbose=verbose,
+            validation_report=report,
+        )
+        return json.dumps(result, indent=2, default=str)
 
     @app.tool()
     async def create_walk_run_workout(
