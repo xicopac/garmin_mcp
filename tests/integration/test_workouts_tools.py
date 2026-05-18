@@ -1190,6 +1190,80 @@ def _sprint_primer_steps(repeats=6):
     ]
 
 
+def _aerobic_builder_payload(
+    *,
+    name="GPT Aerobic Builder Run - Controlled",
+    description="Controlled aerobic builder.",
+    warmup_pace=(1000 / 306, 1000 / 321),
+    interval_pace=(1000 / 300, 1000 / 307),
+):
+    return {
+        "workoutId": 1567175576,
+        "workoutName": name,
+        "description": description,
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+            "workoutSteps": [
+                {"type": "ExecutableStepDTO", "stepOrder": 1,
+                 "stepType": {"stepTypeId": 1, "stepTypeKey": "warmup"},
+                 "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                 "endConditionValue": 600.0,
+                 "targetType": {"workoutTargetTypeId": 6, "workoutTargetTypeKey": "pace.zone"},
+                 "targetValueOne": warmup_pace[0],
+                 "targetValueTwo": warmup_pace[1]},
+                {"type": "ExecutableStepDTO", "stepOrder": 2,
+                 "stepType": {"stepTypeId": 3, "stepTypeKey": "interval"},
+                 "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                 "endConditionValue": 1500.0,
+                 "targetType": {"workoutTargetTypeId": 6, "workoutTargetTypeKey": "pace.zone"},
+                 "targetValueOne": interval_pace[0],
+                 "targetValueTwo": interval_pace[1]},
+                {"type": "ExecutableStepDTO", "stepOrder": 3,
+                 "stepType": {"stepTypeId": 2, "stepTypeKey": "cooldown"},
+                 "endCondition": {"conditionTypeId": 2, "conditionTypeKey": "time"},
+                 "endConditionValue": 300.0,
+                 "targetType": {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}},
+            ],
+        }],
+    }
+
+
+def _aerobic_builder_steps():
+    return [
+        {"kind": "warmup", "duration_seconds": 600, "pace_seconds_per_km": [306, 321]},
+        {"kind": "interval", "duration_seconds": 1500, "pace_seconds_per_km": [300, 307]},
+        {"kind": "cooldown", "duration_seconds": 300},
+    ]
+
+
+def _alias_repeat_payload(repeats=6, description=None):
+    payload = {
+        "workoutId": 1567175577,
+        "workoutName": "GPT Sprint Primer Run",
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+            "workoutSteps": [
+                {"kind": "warmup", "end_condition": "distance", "end_condition_value": 1000.0,
+                 "target_type": "no.target"},
+                {"kind": "repeat", "repeat_count": repeats, "end_condition_value": float(repeats),
+                 "steps": [
+                     {"kind": "interval", "end_condition": "time", "end_condition_value": 15.0,
+                      "target_type": "no.target"},
+                     {"kind": "recovery", "end_condition": "time", "end_condition_value": 90.0,
+                      "target_type": "no.target"},
+                 ]},
+            ],
+        }],
+    }
+    if description is not None:
+        payload["description"] = description
+    return payload
+
+
 @pytest.mark.asyncio
 async def test_upload_workout_progression_run_uploads(app_with_workouts, mock_garmin_client):
     """Acceptance: a progression run with warmup/cooldown uploads successfully."""
@@ -1500,6 +1574,131 @@ async def test_update_running_workout_updates_repeat_count_in_place_and_preserve
 
 
 @pytest.mark.asyncio
+async def test_update_running_workout_pace_targets_uses_semantic_readback_verification(
+    app_with_workout_builders, mock_garmin_client
+):
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    before = _aerobic_builder_payload(description="Old aerobic builder.")
+    # Garmin may round speed values on read-back. These are still semantically
+    # equivalent to the requested pace ranges within the 0.01 m/s tolerance.
+    after = _aerobic_builder_payload(
+        warmup_pace=(3.268, 3.116),
+        interval_pace=(3.333, 3.258),
+    )
+    mock_garmin_client.get_workout_by_id.side_effect = [before, after]
+    mock_garmin_client.garmin_workouts = "workout-service"
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {}
+    mock_garmin_client.client.put.return_value = response
+
+    result = await app_with_workout_builders.call_tool(
+        "update_running_workout",
+        {
+            "workout_id": 1567175576,
+            "name": "GPT Aerobic Builder Run - Controlled",
+            "description": "Controlled aerobic builder.",
+            "steps": _aerobic_builder_steps(),
+        },
+    )
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "success"
+    assert data["warnings"] == []
+    assert data["verification_report"]["mode"] == "canonical_semantic_running"
+    assert data["verification_report"]["ok"] is True
+    assert data["garmin_response_summary"]["body_keys"] == []
+
+
+@pytest.mark.asyncio
+async def test_update_running_workout_repeat_aliases_match_requested_iterations(
+    app_with_workout_builders, mock_garmin_client
+):
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    description = "Six relaxed sprint-backs."
+    before = _sprint_primer_payload(repeats=4)
+    after = _alias_repeat_payload(repeats=6, description=description)
+    mock_garmin_client.get_workout_by_id.side_effect = [before, after]
+    mock_garmin_client.garmin_workouts = "workout-service"
+    response = MagicMock()
+    response.status_code = 204
+    response.json.side_effect = ValueError("no body")
+    mock_garmin_client.client.put.return_value = response
+
+    result = await app_with_workout_builders.call_tool(
+        "update_running_workout",
+        {
+            "workout_id": 1567175577,
+            "name": "GPT Sprint Primer Run",
+            "description": description,
+            "steps": _sprint_primer_steps(repeats=6),
+        },
+    )
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "success"
+    assert data["warnings"] == []
+    assert data["verification_report"]["ok"] is True
+    assert data["verification_report"]["fetched_canonical"]["steps"][1]["repeat_iterations"] == 6
+
+
+@pytest.mark.asyncio
+async def test_update_workout_template_pace_conversion_tolerance_accepts_alias_values(
+    app_with_workouts, mock_garmin_client
+):
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    before = _aerobic_builder_payload(description="Old")
+    requested = _aerobic_builder_payload(
+        description="Controlled aerobic builder.",
+        warmup_pace=(1000 / 300, 1000 / 307.2),
+        interval_pace=(1000 / 300, 1000 / 307.2),
+    )
+    requested.pop("workoutId")
+    fetched = {
+        "workoutId": 1567175576,
+        "workoutName": "GPT Aerobic Builder Run - Controlled",
+        "description": "Controlled aerobic builder.",
+        "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType": {"sportTypeId": 1, "sportTypeKey": "running"},
+            "workoutSteps": [
+                {"kind": "warmup", "end_condition": "time", "end_condition_value": 600.0,
+                 "target_type": "pace.zone", "target_value_low": 3.3333333,
+                 "target_value_high": 3.2552083},
+                {"kind": "interval", "end_condition": "time", "end_condition_value": 1500.0,
+                 "target_type": "pace.zone", "target_value_low": 3.3333333,
+                 "target_value_high": 3.2552083},
+                {"kind": "cooldown", "end_condition": "time", "end_condition_value": 300.0,
+                 "target_type": "no.target"},
+            ],
+        }],
+    }
+    mock_garmin_client.get_workout_by_id.side_effect = [before, fetched]
+    mock_garmin_client.garmin_workouts = "workout-service"
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {}
+    mock_garmin_client.client.put.return_value = response
+
+    result = await app_with_workouts.call_tool(
+        "update_workout_template",
+        {"workout_id": 1567175576, "workout_data": requested},
+    )
+    data = json_module.loads(result[0][0].text)
+
+    assert data["status"] == "success"
+    assert data["warnings"] == []
+    assert data["verification_report"]["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_update_workout_template_refuses_sport_mismatch(app_with_workouts, mock_garmin_client):
     import json as json_module
 
@@ -1588,7 +1787,10 @@ async def test_update_workout_template_verification_failure_returns_partial(
     data = json_module.loads(result[0][0].text)
 
     assert data["status"] == "partial"
-    assert any("segments did not match" in warning for warning in data["warnings"])
+    assert not any("segments did not match" in warning for warning in data["warnings"])
+    assert any("repeat_iterations" in warning for warning in data["warnings"])
+    assert data["verification_report"]["mode"] == "canonical_semantic_running"
+    assert data["verification_report"]["ok"] is False
     assert data["before_summary"]["segments"][0]["steps"][1]["repeat_count"] == 4
     assert data["after_summary"]["segments"][0]["steps"][1]["repeat_count"] == 4
     mock_garmin_client.client.delete.assert_not_called()

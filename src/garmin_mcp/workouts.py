@@ -192,6 +192,9 @@ def _sport_key(workout_data: Any) -> Optional[str]:
     """Return the Garmin sportTypeKey from a workout-like payload."""
     if not isinstance(workout_data, dict):
         return None
+    direct = workout_data.get("sportTypeKey") or workout_data.get("sport")
+    if isinstance(direct, str) and direct:
+        return direct
     sport = workout_data.get("sportType")
     if isinstance(sport, dict):
         key = sport.get("sportTypeKey")
@@ -270,6 +273,257 @@ def _workout_update_summary(workout_data: Any) -> Dict[str, Any]:
                 "steps": [_step_signature(step) for step in steps] if isinstance(steps, list) else [],
             })
     return {k: v for k, v in summary.items() if v is not None}
+
+
+def _normalized_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return " ".join(str(value).split())
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(mapping: Dict[str, Any], keys: List[str]) -> Any:
+    for key in keys:
+        if mapping.get(key) is not None:
+            return mapping.get(key)
+    return None
+
+
+def _nested_key(mapping: Dict[str, Any], object_key: str, value_key: str) -> Optional[str]:
+    nested = mapping.get(object_key)
+    if isinstance(nested, dict):
+        value = nested.get(value_key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _type_key(mapping: Dict[str, Any], object_key: str, direct_keys: List[str], nested_key: str) -> Optional[str]:
+    direct = _first_present(mapping, direct_keys)
+    if isinstance(direct, str) and direct:
+        return direct
+    return _nested_key(mapping, object_key, nested_key)
+
+
+def _repeat_iterations(step: Dict[str, Any]) -> Optional[int]:
+    return _int_or_none(
+        _first_present(
+            step,
+            [
+                "numberOfIterations",
+                "number_of_iterations",
+                "repeat_count",
+                "repeatCount",
+                "end_condition_value",
+                "endConditionValue",
+            ],
+        )
+    )
+
+
+def _canonical_running_step(step: Any) -> Dict[str, Any]:
+    """Normalize requested and Garmin-read-back DTO variants into semantic running steps."""
+    if not isinstance(step, dict):
+        return {"invalid_step_type": type(step).__name__}
+
+    dto = step.get("type")
+    if (
+        dto == "RepeatGroupDTO"
+        or step.get("kind") == "repeat"
+        or step.get("repeat_count") is not None
+        or step.get("numberOfIterations") is not None
+    ):
+        children = step.get("workoutSteps")
+        if children is None:
+            children = step.get("steps")
+        return {
+            "kind": "repeat",
+            "repeat_iterations": _repeat_iterations(step),
+            "steps": [_canonical_running_step(child) for child in children or []],
+        }
+
+    kind = _type_key(step, "stepType", ["stepTypeKey", "step_type_key", "kind"], "stepTypeKey")
+    end_condition = _type_key(
+        step,
+        "endCondition",
+        ["endConditionKey", "end_condition", "end_condition_key", "conditionTypeKey"],
+        "conditionTypeKey",
+    )
+    end_value = _float_or_none(
+        _first_present(step, ["endConditionValue", "end_condition_value", "end_value"])
+    )
+    target_type = _type_key(
+        step,
+        "targetType",
+        ["targetTypeKey", "target_type", "target_type_key", "workoutTargetTypeKey"],
+        "workoutTargetTypeKey",
+    ) or "no.target"
+
+    canonical: Dict[str, Any] = {
+        "kind": kind,
+        "target_type": target_type,
+    }
+    if end_condition == "time":
+        canonical["duration_seconds"] = end_value
+    elif end_condition == "distance":
+        canonical["distance_meters"] = end_value
+    elif end_condition:
+        canonical["end_condition"] = end_condition
+        canonical["end_condition_value"] = end_value
+
+    zone = _int_or_none(_first_present(step, ["zoneNumber", "zone_number", "hr_zone"]))
+    target_one = _float_or_none(
+        _first_present(step, ["targetValueOne", "target_value_one", "target_value_low", "targetValueLow"])
+    )
+    target_two = _float_or_none(
+        _first_present(step, ["targetValueTwo", "target_value_two", "target_value_high", "targetValueHigh"])
+    )
+    if target_type == "heart.rate.zone":
+        if zone is not None:
+            canonical["hr_zone"] = zone
+        elif target_one is not None or target_two is not None:
+            canonical["hr_bpm_range"] = [target_one, target_two]
+    elif target_type == "pace.zone":
+        canonical["pace_mps"] = [target_one, target_two]
+
+    return {k: v for k, v in canonical.items() if v is not None}
+
+
+def _canonical_running_workout(workout_data: Any) -> Dict[str, Any]:
+    """Normalize a running workout to the semantic fields update verification cares about."""
+    if not isinstance(workout_data, dict):
+        return {"valid": False, "type": type(workout_data).__name__}
+
+    segments = workout_data.get("workoutSegments")
+    if segments is None and isinstance(workout_data.get("segments"), list):
+        segments = workout_data.get("segments")
+
+    steps: List[Dict[str, Any]] = []
+    if isinstance(segments, list):
+        ordered_segments = sorted(
+            [segment for segment in segments if isinstance(segment, dict)],
+            key=lambda segment: _int_or_none(segment.get("segmentOrder") or segment.get("order")) or 0,
+        )
+        for segment in ordered_segments:
+            segment_steps = segment.get("workoutSteps")
+            if segment_steps is None:
+                segment_steps = segment.get("steps")
+            if isinstance(segment_steps, list):
+                steps.extend(_canonical_running_step(step) for step in segment_steps)
+
+    return {
+        "name": workout_data.get("workoutName") or workout_data.get("name"),
+        "sport": _sport_key(workout_data),
+        "description": _normalized_text(workout_data.get("description")),
+        "steps": steps,
+    }
+
+
+def _numbers_match(expected: Any, actual: Any, tolerance: float) -> bool:
+    expected_float = _float_or_none(expected)
+    actual_float = _float_or_none(actual)
+    if expected_float is None or actual_float is None:
+        return expected == actual
+    return abs(expected_float - actual_float) <= tolerance
+
+
+def _compare_running_steps(expected: List[Dict[str, Any]], actual: List[Dict[str, Any]], path: str) -> List[str]:
+    issues: List[str] = []
+    if len(expected) != len(actual):
+        issues.append(f"{path}: step count expected {len(expected)}, got {len(actual)}")
+        return issues
+
+    for index, (exp, got) in enumerate(zip(expected, actual), start=1):
+        step_path = f"{path}[{index}]"
+        if exp.get("kind") != got.get("kind"):
+            issues.append(f"{step_path}.kind expected {exp.get('kind')!r}, got {got.get('kind')!r}")
+            continue
+
+        if exp.get("kind") == "repeat":
+            if exp.get("repeat_iterations") != got.get("repeat_iterations"):
+                issues.append(
+                    f"{step_path}.repeat_iterations expected {exp.get('repeat_iterations')!r}, "
+                    f"got {got.get('repeat_iterations')!r}"
+                )
+            issues.extend(
+                _compare_running_steps(exp.get("steps") or [], got.get("steps") or [], f"{step_path}.steps")
+            )
+            continue
+
+        for field, tolerance in (("duration_seconds", 0.001), ("distance_meters", 0.001)):
+            if exp.get(field) is not None or got.get(field) is not None:
+                if not _numbers_match(exp.get(field), got.get(field), tolerance):
+                    issues.append(f"{step_path}.{field} expected {exp.get(field)!r}, got {got.get(field)!r}")
+
+        if exp.get("target_type") != got.get("target_type"):
+            issues.append(
+                f"{step_path}.target_type expected {exp.get('target_type')!r}, got {got.get('target_type')!r}"
+            )
+            continue
+
+        if exp.get("hr_zone") != got.get("hr_zone"):
+            issues.append(f"{step_path}.hr_zone expected {exp.get('hr_zone')!r}, got {got.get('hr_zone')!r}")
+        if exp.get("hr_bpm_range") != got.get("hr_bpm_range"):
+            issues.append(
+                f"{step_path}.hr_bpm_range expected {exp.get('hr_bpm_range')!r}, got {got.get('hr_bpm_range')!r}"
+            )
+
+        exp_pace = exp.get("pace_mps")
+        got_pace = got.get("pace_mps")
+        if exp_pace is not None or got_pace is not None:
+            if not isinstance(exp_pace, list) or not isinstance(got_pace, list) or len(exp_pace) != len(got_pace):
+                issues.append(f"{step_path}.pace_mps expected {exp_pace!r}, got {got_pace!r}")
+            else:
+                for pace_index, (exp_value, got_value) in enumerate(zip(exp_pace, got_pace), start=1):
+                    if not _numbers_match(exp_value, got_value, 0.01):
+                        issues.append(
+                            f"{step_path}.pace_mps[{pace_index}] expected {exp_value!r}, got {got_value!r}"
+                        )
+    return issues
+
+
+def _verify_running_workout_update(requested: Dict[str, Any], fetched: Any) -> Dict[str, Any]:
+    requested_canonical = _canonical_running_workout(requested)
+    fetched_canonical = _canonical_running_workout(fetched)
+    issues: List[str] = []
+
+    for field in ("name", "sport", "description"):
+        if requested_canonical.get(field) != fetched_canonical.get(field):
+            issues.append(
+                f"{field} expected {requested_canonical.get(field)!r}, got {fetched_canonical.get(field)!r}"
+            )
+    issues.extend(
+        _compare_running_steps(
+            requested_canonical.get("steps") or [],
+            fetched_canonical.get("steps") or [],
+            "steps",
+        )
+    )
+
+    return {
+        "ok": not issues,
+        "mode": "canonical_semantic_running",
+        "issues": issues,
+        "requested_canonical": requested_canonical,
+        "fetched_canonical": fetched_canonical,
+    }
 
 
 def _response_summary(response: Any) -> Dict[str, Any]:
@@ -452,6 +706,7 @@ def update_workout_template_payload(
 
     after = None
     after_summary = None
+    verification_report: Optional[Dict[str, Any]] = None
     verification_issues: List[str] = []
     if verify_after_update:
         try:
@@ -472,11 +727,25 @@ def update_workout_template_payload(
                 },
             )
         after_summary = _workout_update_summary(after)
-        if after_summary.get("workout_id") != wid:
-            verification_issues.append("workout_id changed or was missing after update")
-        for field in ("name", "sport", "description", "segment_count", "segments"):
-            if after_summary.get(field) != requested_summary.get(field):
-                verification_issues.append(f"{field} did not match requested payload after update")
+        after_id = after_summary.get("workout_id")
+        if after_id is not None and after_id != wid:
+            verification_issues.append(f"workout_id expected {wid!r}, got {after_id!r}")
+        if _sport_key(payload) == "running":
+            verification_report = _verify_running_workout_update(payload, after)
+            verification_issues.extend(verification_report["issues"])
+        else:
+            verification_report = {
+                "ok": True,
+                "mode": "strict_summary",
+                "issues": [],
+                "requested_summary": requested_summary,
+                "fetched_summary": after_summary,
+            }
+            for field in ("name", "sport", "description", "segment_count", "segments"):
+                if after_summary.get(field) != requested_summary.get(field):
+                    verification_report["issues"].append(f"{field} did not match requested payload after update")
+            verification_report["ok"] = not verification_report["issues"]
+            verification_issues.extend(verification_report["issues"])
 
     result: Dict[str, Any] = {
         "status": "partial" if verification_issues else "success",
@@ -484,6 +753,7 @@ def update_workout_template_payload(
         "before_summary": before_summary,
         "after_summary": after_summary or requested_summary,
         "validation_report": validation_report,
+        "verification_report": verification_report,
         "garmin_response_summary": _response_summary(response),
         "warnings": warnings + verification_issues,
     }
